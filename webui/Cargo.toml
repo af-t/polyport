@@ -1,0 +1,16 @@
+[package]
+name = "polyport"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89.0"
+
+[[bin]]
+name = "polyport"
+path = "src/main.rs"
+
+[dependencies]
+polyport-core = { version = "0.1.0", path = "../core" }
+rust-embed = "8.13"
+
+[lints]
+workspace = true

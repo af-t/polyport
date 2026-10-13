@@ -1,38 +1,11 @@
-[package]
-name = "polyport"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89.0"
+[workspace]
+resolver = "3"
+members = ["core", "webui"]
+default-members = ["webui"]
 
-[[bin]]
-name = "polyport"
-path = "src/main.rs"
-
-[dependencies]
-tokio = { version = "1.53", features = ["full"] }
-axum = { version = "0.8", features = ["ws"] }
-reqwest = { version = "0.13", features = ["json", "stream", "rustls"] }
-tokio-tungstenite = "0.30"
-tower = "0.5"
-tower-http = { version = "0.7", features = ["trace", "timeout", "compression-full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-futures = "0.3"
-clap = { version = "4.6", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-thiserror = "2.0"
-anyhow = "1.0"
-uuid = { version = "1.28", features = ["v4"] }
-mime = "0.3"
-mime_guess = "2.0"
-rust-embed = "8.13"
-httpdate = "1"
-sha2 = "0.11"
-
-[lints.rust]
+[workspace.lints.rust]
 warnings = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = "deny"
 pedantic = "deny"
