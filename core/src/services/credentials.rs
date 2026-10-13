@@ -348,6 +348,18 @@ pub fn decode_oidc_account_id(id_token: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[must_use]
+pub fn decode_chatgpt_account_id(id_token: Option<&str>) -> Option<String> {
+    let payload_part = id_token?.split('.').nth(1)?;
+    let bytes = b64url_decode(payload_part)?;
+    let payload: Value = serde_json::from_slice(&bytes).ok()?;
+    payload
+        .get("https://api.openai.com/auth")
+        .and_then(|a| a.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 /// # Errors
 /// Fails when neither email nor uuid is present.
 pub fn derive_claude_account_id(email: Option<&str>, account_uuid: Option<&str>) -> anyhow::Result<String> {
@@ -746,6 +758,12 @@ mod tests {
             decode_oidc_account_id(Some(&format!("x.{sub}.y"))).as_deref(),
             Some("999")
         );
+        let chatgpt = b64url_encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acc-xyz-123"}}"#);
+        assert_eq!(
+            decode_chatgpt_account_id(Some(&format!("x.{chatgpt}.y"))).as_deref(),
+            Some("acc-xyz-123")
+        );
+        assert_eq!(decode_chatgpt_account_id(None), None);
         assert_eq!(decode_oidc_account_id(None), None);
         assert_eq!(decode_oidc_account_id(Some("not-a-jwt")), None);
     }
