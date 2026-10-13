@@ -30,6 +30,7 @@ fn to_hex_digest(bytes: &[u8]) -> String {
 pub fn get_device_id() -> String {
     let hostname = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
+        .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
         .unwrap_or_else(|_| "localhost".to_string());
     let mut hasher = Sha256::new();
     hasher.update(hostname.as_bytes());

@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -64,26 +64,33 @@ fn attempt_error_to_response(err: &AttemptError) -> Response {
         .into_response()
 }
 
-fn handle_gemini_messages_stream(stream_res: GeminiStreamResult, model: &str) -> Response {
+fn stream_sse_transformed<F>(
+    mut byte_stream: impl futures::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    mut transform: F,
+) -> Response
+where
+    F: FnMut(&str) -> Vec<String> + Send + 'static,
+{
     let (mut tx, rx) = futures::channel::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
-    let model_name = model.to_string();
     tokio::spawn(async move {
-        let mut stream = stream_res.response.bytes_stream();
-        let mut buffer = String::new();
-        let mut sse_state = AnthropicStreamState::new(&format!("msg_{}", uuid::Uuid::new_v4()), &model_name);
-        while let Some(Ok(bytes)) = stream.next().await {
-            if let Ok(chunk_str) = std::str::from_utf8(&bytes) {
-                buffer.push_str(chunk_str);
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].to_string();
-                    buffer.drain(..=pos);
-                    if let Some(parsed) = parse_gemini_sse_line(&line) {
-                        let events = gemini_to_anthropic_sse(&parsed, &mut sse_state);
-                        for ev in events {
-                            let _ = tx.send(Ok(axum::body::Bytes::from(ev))).await;
-                        }
+        let mut byte_buf = Vec::new();
+        while let Some(Ok(bytes)) = byte_stream.next().await {
+            byte_buf.extend_from_slice(&bytes);
+            while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = byte_buf.drain(..=pos).collect();
+                if let Ok(line) = std::str::from_utf8(&line_bytes) {
+                    let events = transform(line);
+                    for ev in events {
+                        let _ = tx.send(Ok(axum::body::Bytes::from(ev))).await;
                     }
                 }
+            }
+        }
+        let line_opt = std::str::from_utf8(&byte_buf).ok().filter(|s| !s.is_empty());
+        if let Some(line) = line_opt {
+            let events = transform(line);
+            for ev in events {
+                let _ = tx.send(Ok(axum::body::Bytes::from(ev))).await;
             }
         }
     });
@@ -93,6 +100,17 @@ fn handle_gemini_messages_stream(stream_res: GeminiStreamResult, model: &str) ->
         .header("Cache-Control", "no-cache")
         .body(body)
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
+}
+
+fn handle_gemini_messages_stream(stream_res: GeminiStreamResult, model: &str) -> Response {
+    let mut sse_state = AnthropicStreamState::new(&format!("msg_{}", uuid::Uuid::new_v4()), model);
+    stream_sse_transformed(stream_res.response.bytes_stream(), move |line| {
+        if let Some(parsed) = parse_gemini_sse_line(line) {
+            gemini_to_anthropic_sse(&parsed, &mut sse_state)
+        } else {
+            Vec::new()
+        }
+    })
 }
 
 async fn handle_gemini_messages_buffered(stream_res: GeminiStreamResult, model: &str) -> Response {
@@ -118,7 +136,13 @@ async fn handle_gemini_messages_buffered(stream_res: GeminiStreamResult, model: 
         .into_response()
 }
 
-async fn dispatch_gemini_messages(state: &AppState, req: &MessagesRequest, route: &RouteDecision) -> Response {
+async fn dispatch_gemini_messages(
+    state: &AppState,
+    req: &MessagesRequest,
+    route: &RouteDecision,
+    preferred_account_id: Option<String>,
+    lookup_keys: &[String],
+) -> Response {
     let is_thinking_requested = req.thinking.is_some() || req.effort.is_some();
     let system_str = match &req.system {
         Some(Value::String(s)) => Some(s.as_str()),
@@ -154,12 +178,16 @@ async fn dispatch_gemini_messages(state: &AppState, req: &MessagesRequest, route
         tool_config: req.tool_choice.clone(),
         upstream_model: route.upstream_model.clone(),
         model_class: route.model_class,
-        preferred_account_id: None,
+        preferred_account_id,
     };
 
     let model_name = req.model.as_deref().unwrap_or(&route.upstream_model);
     match call_gemini_stream(&params, &state.pool, &state.http_client).await {
         Ok(stream_res) => {
+            {
+                let mut guard = state.pool.write().await;
+                guard.record_account_pin(Provider::Gemini, lookup_keys, Some(&stream_res.account_id));
+            }
             if req.stream.unwrap_or(false) {
                 handle_gemini_messages_stream(stream_res, model_name)
             } else {
@@ -175,6 +203,9 @@ async fn dispatch_claude_messages(
     req: &MessagesRequest,
     upstream_model: &str,
     model_class: ModelClass,
+    preferred_account_id: Option<String>,
+    lookup_keys: &[String],
+    headers: HeaderMap,
 ) -> Response {
     let mut claude_body = serde_json::to_value(req).unwrap_or_default();
     let mapped_model = map_anthropic_model(upstream_model);
@@ -185,12 +216,16 @@ async fn dispatch_claude_messages(
     let params = CallClaudeParams {
         body: claude_body,
         model_class,
-        preferred_account_id: None,
-        client_headers: None,
+        preferred_account_id,
+        client_headers: Some(headers),
     };
 
     match call_claude_stream(&params, &state.pool, &state.http_client).await {
         Ok(stream_res) => {
+            {
+                let mut guard = state.pool.write().await;
+                guard.record_account_pin(Provider::Claude, lookup_keys, Some(&stream_res.account_id));
+            }
             if req.stream.unwrap_or(false) {
                 let body = axum::body::Body::from_stream(stream_res.response.bytes_stream());
                 Response::builder()
@@ -212,34 +247,14 @@ async fn dispatch_claude_messages(
 }
 
 fn handle_codex_messages_stream(stream_res: CodexStreamResult, model: &str) -> Response {
-    let (mut tx, rx) = futures::channel::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
-    let model_name = model.to_string();
-    tokio::spawn(async move {
-        let mut stream = stream_res.response.bytes_stream();
-        let mut buffer = String::new();
-        let mut sse_state = AnthropicStreamState::new(&format!("msg_{}", uuid::Uuid::new_v4()), &model_name);
-        while let Some(Ok(bytes)) = stream.next().await {
-            if let Ok(chunk_str) = std::str::from_utf8(&bytes) {
-                buffer.push_str(chunk_str);
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].to_string();
-                    buffer.drain(..=pos);
-                    if let Some(parsed) = parse_codex_sse_line(&line) {
-                        let events = codex_to_anthropic_sse(&parsed, &mut sse_state);
-                        for ev in events {
-                            let _ = tx.send(Ok(axum::body::Bytes::from(ev))).await;
-                        }
-                    }
-                }
-            }
+    let mut sse_state = AnthropicStreamState::new(&format!("msg_{}", uuid::Uuid::new_v4()), model);
+    stream_sse_transformed(stream_res.response.bytes_stream(), move |line| {
+        if let Some(parsed) = parse_codex_sse_line(line) {
+            codex_to_anthropic_sse(&parsed, &mut sse_state)
+        } else {
+            Vec::new()
         }
-    });
-    let body = axum::body::Body::from_stream(rx);
-    Response::builder()
-        .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .body(body)
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
+    })
 }
 
 async fn handle_codex_messages_buffered(stream_res: CodexStreamResult, model: &str) -> Response {
@@ -270,6 +285,8 @@ async fn dispatch_codex_messages(
     req: &MessagesRequest,
     upstream_model: &str,
     model_class: ModelClass,
+    preferred_account_id: Option<String>,
+    lookup_keys: &[String],
 ) -> Response {
     let raw_val = serde_json::to_value(req).unwrap_or_default();
     let responses_body = match map_anthropic_to_responses(&raw_val, Some(upstream_model)) {
@@ -285,16 +302,35 @@ async fn dispatch_codex_messages(
         }
     };
 
+    let conversation_id = {
+        let mut guard = state.pool.write().await;
+        let cid = if lookup_keys.is_empty() {
+            None
+        } else {
+            guard
+                .resolve_conversation_id(Provider::Codex, lookup_keys)
+                .or_else(|| Some(uuid::Uuid::new_v4().to_string()))
+        };
+        if let Some(ref id) = cid {
+            guard.record_conversation_id(Provider::Codex, lookup_keys, Some(id));
+        }
+        cid
+    };
+
     let params = CallCodexParams {
         body: responses_body,
         model_class,
-        preferred_account_id: None,
-        conversation_id: None,
+        preferred_account_id,
+        conversation_id,
     };
 
     let model_name = req.model.as_deref().unwrap_or(upstream_model);
     match call_codex_stream(&params, &state.pool, &state.http_client).await {
         Ok(stream_res) => {
+            {
+                let mut guard = state.pool.write().await;
+                guard.record_account_pin(Provider::Codex, lookup_keys, Some(&stream_res.account_id));
+            }
             if req.stream.unwrap_or(false) {
                 handle_codex_messages_stream(stream_res, model_name)
             } else {
@@ -307,6 +343,7 @@ async fn dispatch_codex_messages(
 
 pub async fn v1_messages_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Result<Json<MessagesRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Ok(Json(req)) = body else {
@@ -352,14 +389,26 @@ pub async fn v1_messages_handler(
             .into_response();
     };
 
+    let messages_val = serde_json::to_value(&req.messages).unwrap_or_default();
+    let (preferred_account_id, lookup_keys) = {
+        let mut guard = state.pool.write().await;
+        let pref = guard.resolve_preferred_account(candidate.route.provider, &headers, &messages_val);
+        (pref.account_id, pref.lookup_keys)
+    };
+
     match candidate.route.provider {
-        Provider::Gemini => dispatch_gemini_messages(&state, &req, &candidate.route).await,
+        Provider::Gemini => {
+            dispatch_gemini_messages(&state, &req, &candidate.route, preferred_account_id, &lookup_keys).await
+        }
         Provider::Claude => {
             dispatch_claude_messages(
                 &state,
                 &req,
                 &candidate.route.upstream_model,
                 candidate.route.model_class,
+                preferred_account_id,
+                &lookup_keys,
+                headers,
             )
             .await
         }
@@ -369,6 +418,8 @@ pub async fn v1_messages_handler(
                 &req,
                 &candidate.route.upstream_model,
                 candidate.route.model_class,
+                preferred_account_id,
+                &lookup_keys,
             )
             .await
         }
@@ -376,34 +427,14 @@ pub async fn v1_messages_handler(
 }
 
 fn handle_gemini_completions_stream(stream_res: GeminiStreamResult, model: &str) -> Response {
-    let (mut tx, rx) = futures::channel::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
-    let model_name = model.to_string();
-    tokio::spawn(async move {
-        let mut stream = stream_res.response.bytes_stream();
-        let mut buffer = String::new();
-        let mut sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), &model_name);
-        while let Some(Ok(bytes)) = stream.next().await {
-            if let Ok(chunk_str) = std::str::from_utf8(&bytes) {
-                buffer.push_str(chunk_str);
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].to_string();
-                    buffer.drain(..=pos);
-                    if let Some(parsed) = parse_gemini_sse_line(&line) {
-                        let events = gemini_to_openai_sse(&parsed, &mut sse_state);
-                        for ev in events {
-                            let _ = tx.send(Ok(axum::body::Bytes::from(ev))).await;
-                        }
-                    }
-                }
-            }
+    let mut sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), model);
+    stream_sse_transformed(stream_res.response.bytes_stream(), move |line| {
+        if let Some(parsed) = parse_gemini_sse_line(line) {
+            gemini_to_openai_sse(&parsed, &mut sse_state)
+        } else {
+            Vec::new()
         }
-    });
-    let body = axum::body::Body::from_stream(rx);
-    Response::builder()
-        .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .body(body)
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
+    })
 }
 
 async fn handle_gemini_completions_buffered(stream_res: GeminiStreamResult, model: &str) -> Response {
@@ -435,7 +466,13 @@ async fn handle_gemini_completions_buffered(stream_res: GeminiStreamResult, mode
         .into_response()
 }
 
-async fn dispatch_gemini_completions(state: &AppState, req: &CompletionsRequest, route: &RouteDecision) -> Response {
+async fn dispatch_gemini_completions(
+    state: &AppState,
+    req: &CompletionsRequest,
+    route: &RouteDecision,
+    preferred_account_id: Option<String>,
+    lookup_keys: &[String],
+) -> Response {
     let is_thinking_requested = req.effort.is_some();
     let raw_val = serde_json::to_value(req).unwrap_or_default();
     let messages_val = serde_json::to_value(&req.messages).unwrap_or_default();
@@ -466,12 +503,16 @@ async fn dispatch_gemini_completions(state: &AppState, req: &CompletionsRequest,
         tool_config: None,
         upstream_model: route.upstream_model.clone(),
         model_class: route.model_class,
-        preferred_account_id: None,
+        preferred_account_id,
     };
 
     let model_name = req.model.as_deref().unwrap_or(&route.upstream_model);
     match call_gemini_stream(&params, &state.pool, &state.http_client).await {
         Ok(stream_res) => {
+            {
+                let mut guard = state.pool.write().await;
+                guard.record_account_pin(Provider::Gemini, lookup_keys, Some(&stream_res.account_id));
+            }
             if req.stream.unwrap_or(false) {
                 handle_gemini_completions_stream(stream_res, model_name)
             } else {
@@ -510,44 +551,44 @@ fn map_openai_request_to_claude(req: &CompletionsRequest, upstream_model: &str) 
     let sys_val = system_text.map(Value::String);
     let system = with_claude_code_identity(sys_val.as_ref());
 
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "model": mapped_model,
         "messages": messages,
         "system": system,
         "max_tokens": req.max_tokens.unwrap_or(4096),
         "stream": req.stream.unwrap_or(false),
-    })
+    });
+
+    if let Some(tools) = &req.tools {
+        let mapped_tools: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                if let (Some("function"), Some(f)) = (t.get("type").and_then(Value::as_str), t.get("function")) {
+                    return serde_json::json!({
+                        "name": f.get("name").and_then(Value::as_str).unwrap_or(""),
+                        "description": f.get("description").and_then(Value::as_str).unwrap_or(""),
+                        "input_schema": f.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({}))
+                    });
+                }
+                t.clone()
+            })
+            .collect();
+        out["tools"] = Value::Array(mapped_tools);
+    }
+
+    apply_thinking_constraints(&mut out);
+    out
 }
 
 fn handle_claude_completions_stream(stream_res: ClaudeStreamResult, model: &str) -> Response {
-    let (mut tx, rx) = futures::channel::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
-    let model_name = model.to_string();
-    tokio::spawn(async move {
-        let mut stream = stream_res.response.bytes_stream();
-        let mut buffer = String::new();
-        let mut sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), &model_name);
-        while let Some(Ok(bytes)) = stream.next().await {
-            if let Ok(chunk_str) = std::str::from_utf8(&bytes) {
-                buffer.push_str(chunk_str);
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].to_string();
-                    buffer.drain(..=pos);
-                    if let Some(parsed) = parse_anthropic_sse_line(&line) {
-                        let events = anthropic_to_openai_sse(&parsed, &mut sse_state);
-                        for ev in events {
-                            let _ = tx.send(Ok(axum::body::Bytes::from(ev))).await;
-                        }
-                    }
-                }
-            }
+    let mut sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), model);
+    stream_sse_transformed(stream_res.response.bytes_stream(), move |line| {
+        if let Some(parsed) = parse_anthropic_sse_line(line) {
+            anthropic_to_openai_sse(&parsed, &mut sse_state)
+        } else {
+            Vec::new()
         }
-    });
-    let body = axum::body::Body::from_stream(rx);
-    Response::builder()
-        .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .body(body)
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
+    })
 }
 
 async fn handle_claude_completions_buffered(stream_res: ClaudeStreamResult, model: &str) -> Response {
@@ -599,17 +640,24 @@ async fn dispatch_claude_completions(
     req: &CompletionsRequest,
     upstream_model: &str,
     model_class: ModelClass,
+    preferred_account_id: Option<String>,
+    lookup_keys: &[String],
+    headers: HeaderMap,
 ) -> Response {
     let claude_body = map_openai_request_to_claude(req, upstream_model);
     let params = CallClaudeParams {
         body: claude_body,
         model_class,
-        preferred_account_id: None,
-        client_headers: None,
+        preferred_account_id,
+        client_headers: Some(headers),
     };
 
     match call_claude_stream(&params, &state.pool, &state.http_client).await {
         Ok(stream_res) => {
+            {
+                let mut guard = state.pool.write().await;
+                guard.record_account_pin(Provider::Claude, lookup_keys, Some(&stream_res.account_id));
+            }
             let model_name = req.model.clone().unwrap_or_else(|| upstream_model.to_string());
             if req.stream.unwrap_or(false) {
                 handle_claude_completions_stream(stream_res, &model_name)
@@ -622,34 +670,14 @@ async fn dispatch_claude_completions(
 }
 
 fn handle_codex_completions_stream(stream_res: CodexStreamResult, model: &str) -> Response {
-    let (mut tx, rx) = futures::channel::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
-    let model_name = model.to_string();
-    tokio::spawn(async move {
-        let mut stream = stream_res.response.bytes_stream();
-        let mut buffer = String::new();
-        let mut sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), &model_name);
-        while let Some(Ok(bytes)) = stream.next().await {
-            if let Ok(chunk_str) = std::str::from_utf8(&bytes) {
-                buffer.push_str(chunk_str);
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].to_string();
-                    buffer.drain(..=pos);
-                    if let Some(parsed) = parse_codex_sse_line(&line) {
-                        let events = codex_to_openai_sse(&parsed, &mut sse_state);
-                        for ev in events {
-                            let _ = tx.send(Ok(axum::body::Bytes::from(ev))).await;
-                        }
-                    }
-                }
-            }
+    let mut sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), model);
+    stream_sse_transformed(stream_res.response.bytes_stream(), move |line| {
+        if let Some(parsed) = parse_codex_sse_line(line) {
+            codex_to_openai_sse(&parsed, &mut sse_state)
+        } else {
+            Vec::new()
         }
-    });
-    let body = axum::body::Body::from_stream(rx);
-    Response::builder()
-        .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .body(body)
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
+    })
 }
 
 async fn handle_codex_completions_buffered(stream_res: CodexStreamResult, model: &str) -> Response {
@@ -686,6 +714,8 @@ async fn dispatch_codex_completions(
     req: &CompletionsRequest,
     upstream_model: &str,
     model_class: ModelClass,
+    preferred_account_id: Option<String>,
+    lookup_keys: &[String],
 ) -> Response {
     let raw_val = serde_json::to_value(req).unwrap_or_default();
     let responses_body = match map_openai_to_responses(&raw_val, Some(upstream_model)) {
@@ -701,16 +731,35 @@ async fn dispatch_codex_completions(
         }
     };
 
+    let conversation_id = {
+        let mut guard = state.pool.write().await;
+        let cid = if lookup_keys.is_empty() {
+            None
+        } else {
+            guard
+                .resolve_conversation_id(Provider::Codex, lookup_keys)
+                .or_else(|| Some(uuid::Uuid::new_v4().to_string()))
+        };
+        if let Some(ref id) = cid {
+            guard.record_conversation_id(Provider::Codex, lookup_keys, Some(id));
+        }
+        cid
+    };
+
     let params = CallCodexParams {
         body: responses_body,
         model_class,
-        preferred_account_id: None,
-        conversation_id: None,
+        preferred_account_id,
+        conversation_id,
     };
 
     let model_name = req.model.as_deref().unwrap_or(upstream_model);
     match call_codex_stream(&params, &state.pool, &state.http_client).await {
         Ok(stream_res) => {
+            {
+                let mut guard = state.pool.write().await;
+                guard.record_account_pin(Provider::Codex, lookup_keys, Some(&stream_res.account_id));
+            }
             if req.stream.unwrap_or(false) {
                 handle_codex_completions_stream(stream_res, model_name)
             } else {
@@ -723,6 +772,7 @@ async fn dispatch_codex_completions(
 
 pub async fn v1_chat_completions_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Result<Json<CompletionsRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Ok(Json(req)) = body else {
@@ -768,14 +818,26 @@ pub async fn v1_chat_completions_handler(
             .into_response();
     };
 
+    let messages_val = serde_json::to_value(&req.messages).unwrap_or_default();
+    let (preferred_account_id, lookup_keys) = {
+        let mut guard = state.pool.write().await;
+        let pref = guard.resolve_preferred_account(candidate.route.provider, &headers, &messages_val);
+        (pref.account_id, pref.lookup_keys)
+    };
+
     match candidate.route.provider {
-        Provider::Gemini => dispatch_gemini_completions(&state, &req, &candidate.route).await,
+        Provider::Gemini => {
+            dispatch_gemini_completions(&state, &req, &candidate.route, preferred_account_id, &lookup_keys).await
+        }
         Provider::Claude => {
             dispatch_claude_completions(
                 &state,
                 &req,
                 &candidate.route.upstream_model,
                 candidate.route.model_class,
+                preferred_account_id,
+                &lookup_keys,
+                headers,
             )
             .await
         }
@@ -785,6 +847,8 @@ pub async fn v1_chat_completions_handler(
                 &req,
                 &candidate.route.upstream_model,
                 candidate.route.model_class,
+                preferred_account_id,
+                &lookup_keys,
             )
             .await
         }

@@ -664,7 +664,7 @@ async fn resolve_claude_candidates(
     Ok(ids)
 }
 
-fn prepare_claude_attempt_headers(token: &str, client_headers: Option<&HeaderMap>) -> HeaderMap {
+fn prepare_claude_attempt_headers(token: &str, client_headers: Option<&HeaderMap>, session_id: &str) -> HeaderMap {
     let client_ua = client_headers
         .and_then(|h| h.get("user-agent"))
         .and_then(|v| v.to_str().ok());
@@ -686,6 +686,12 @@ fn prepare_claude_attempt_headers(token: &str, client_headers: Option<&HeaderMap
             {
                 headers.insert(key.clone(), val.clone());
             }
+        }
+    }
+    if !headers.contains_key("x-claude-code-session-id") {
+        let val_res = HeaderValue::from_str(session_id);
+        if let Ok(val) = val_res {
+            headers.insert(HeaderName::from_static("x-claude-code-session-id"), val);
         }
     }
     headers
@@ -787,7 +793,7 @@ pub async fn call_claude_stream(
         stamp_claude_metadata(&mut request_body, &session_id);
         inject_claude_code_cache_control(&mut request_body, get_cache_ttl());
 
-        let headers = prepare_claude_attempt_headers(&token, params.client_headers.as_ref());
+        let headers = prepare_claude_attempt_headers(&token, params.client_headers.as_ref(), &session_id);
 
         match execute_claude_attempt(client, &request_body, headers, params.model_class, pool, account_id).await {
             Ok(result) => return Ok(result),

@@ -317,6 +317,18 @@ pub fn map_anthropic_to_responses(body: &Value, model_override: Option<&str>) ->
             let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
             let content = msg.get("content").unwrap_or(&Value::Null);
 
+            if role == "system" || role == "developer" {
+                let text = text_from_content(content);
+                if !text.trim().is_empty() {
+                    input.push(serde_json::json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": text }]
+                    }));
+                }
+                continue;
+            }
+
             let blocks = match content {
                 Value::String(s) => vec![serde_json::json!({ "type": "text", "text": s })],
                 Value::Array(arr) => arr.clone(),

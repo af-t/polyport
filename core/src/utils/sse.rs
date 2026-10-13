@@ -50,6 +50,67 @@ impl AnthropicStreamState {
     }
 }
 
+fn gemini_part_to_anthropic(part: &Value, state: &mut AnthropicStreamState) -> Vec<String> {
+    let mut events = Vec::new();
+    if let Some(text) = part.get("text").and_then(Value::as_str) {
+        if !state.text_block_started {
+            state.text_block_started = true;
+            let block_start = serde_json::json!({
+                "type": "content_block_start",
+                "index": state.block_index,
+                "content_block": {
+                    "type": "text",
+                    "text": ""
+                }
+            });
+            events.push(format!("event: content_block_start\ndata: {block_start}\n\n"));
+        }
+
+        let delta = serde_json::json!({
+            "type": "content_block_delta",
+            "index": state.block_index,
+            "delta": {
+                "type": "text_delta",
+                "text": text
+            }
+        });
+        events.push(format!("event: content_block_delta\ndata: {delta}\n\n"));
+    }
+
+    if let Some(fc) = part.get("functionCall") {
+        let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
+        let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+        let tool_id = format!("toolu_{}", uuid::Uuid::new_v4());
+        let block_start = serde_json::json!({
+            "type": "content_block_start",
+            "index": state.block_index,
+            "content_block": {
+                "type": "tool_use",
+                "id": tool_id,
+                "name": name,
+                "input": {}
+            }
+        });
+        events.push(format!("event: content_block_start\ndata: {block_start}\n\n"));
+        let delta = serde_json::json!({
+            "type": "content_block_delta",
+            "index": state.block_index,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": args.to_string()
+            }
+        });
+        events.push(format!("event: content_block_delta\ndata: {delta}\n\n"));
+        let block_stop = serde_json::json!({
+            "type": "content_block_stop",
+            "index": state.block_index
+        });
+        events.push(format!("event: content_block_stop\ndata: {block_stop}\n\n"));
+        state.block_index += 1;
+    }
+    events
+}
+
 #[must_use]
 pub fn gemini_to_anthropic_sse(chunk: &Value, state: &mut AnthropicStreamState) -> Vec<String> {
     let mut events = Vec::new();
@@ -98,30 +159,7 @@ pub fn gemini_to_anthropic_sse(chunk: &Value, state: &mut AnthropicStreamState) 
 
     if let Some(parts_arr) = parts {
         for part in parts_arr {
-            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                if !state.text_block_started {
-                    state.text_block_started = true;
-                    let block_start = serde_json::json!({
-                        "type": "content_block_start",
-                        "index": state.block_index,
-                        "content_block": {
-                            "type": "text",
-                            "text": ""
-                        }
-                    });
-                    events.push(format!("event: content_block_start\ndata: {block_start}\n\n"));
-                }
-
-                let delta = serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": state.block_index,
-                    "delta": {
-                        "type": "text_delta",
-                        "text": text
-                    }
-                });
-                events.push(format!("event: content_block_delta\ndata: {delta}\n\n"));
-            }
+            events.extend(gemini_part_to_anthropic(part, state));
         }
     }
 
@@ -228,6 +266,34 @@ pub fn gemini_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec
                     }]
                 });
                 events.push(format!("data: {text_chunk}\n\n"));
+            }
+
+            if let Some(fc) = part.get("functionCall") {
+                let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
+                let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let call_id = format!("call_{}", uuid::Uuid::new_v4());
+                let tc_chunk = serde_json::json!({
+                    "id": &state.completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": state.created,
+                    "model": &state.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": args.to_string()
+                                }
+                            }]
+                        },
+                        "finish_reason": serde_json::Value::Null
+                    }]
+                });
+                events.push(format!("data: {tc_chunk}\n\n"));
             }
         }
     }
@@ -387,11 +453,35 @@ pub fn codex_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec<
                 "model": &state.model,
                 "choices": [{
                     "index": 0,
-                    "delta": { "content": text },
+                    "delta": {
+                        "content": text
+                    },
                     "finish_reason": serde_json::Value::Null
                 }]
             });
             events.push(format!("data: {text_chunk}\n\n"));
+        }
+    } else if chunk_type == "response.function_call_arguments.delta" {
+        if let Some(args_delta) = chunk.get("delta").and_then(Value::as_str) {
+            let tc_chunk = serde_json::json!({
+                "id": &state.completion_id,
+                "object": "chat.completion.chunk",
+                "created": state.created,
+                "model": &state.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {
+                                "arguments": args_delta
+                            }
+                        }]
+                    },
+                    "finish_reason": serde_json::Value::Null
+                }]
+            });
+            events.push(format!("data: {tc_chunk}\n\n"));
         }
     } else if chunk_type == "response.completed" && !state.finished {
         state.finished = true;
@@ -455,6 +545,46 @@ pub fn codex_to_anthropic_sse(chunk: &Value, state: &mut AnthropicStreamState) -
                 "delta": { "type": "text_delta", "text": text }
             });
             events.push(format!("event: content_block_delta\ndata: {delta}\n\n"));
+        }
+    } else if chunk_type == "response.output_item.added" {
+        let is_func = chunk.get("item").and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call");
+        if is_func {
+            let item = &chunk["item"];
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+            let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+            let block_start = serde_json::json!({
+                "type": "content_block_start",
+                "index": state.block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": {}
+                }
+            });
+            events.push(format!("event: content_block_start\ndata: {block_start}\n\n"));
+        }
+    } else if chunk_type == "response.function_call_arguments.delta" {
+        if let Some(args_delta) = chunk.get("delta").and_then(Value::as_str) {
+            let delta = serde_json::json!({
+                "type": "content_block_delta",
+                "index": state.block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": args_delta
+                }
+            });
+            events.push(format!("event: content_block_delta\ndata: {delta}\n\n"));
+        }
+    } else if chunk_type == "response.output_item.done" {
+        let is_func = chunk.get("item").and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call");
+        if is_func {
+            let block_stop = serde_json::json!({
+                "type": "content_block_stop",
+                "index": state.block_index
+            });
+            events.push(format!("event: content_block_stop\ndata: {block_stop}\n\n"));
+            state.block_index += 1;
         }
     } else if chunk_type == "response.completed" && !state.finished {
         state.finished = true;
