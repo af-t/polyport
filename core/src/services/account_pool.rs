@@ -280,14 +280,14 @@ impl AttemptError {
         }
     }
 
-    fn is_deterministic_client_error(&self) -> bool {
+    pub(crate) fn is_deterministic_client_error(&self) -> bool {
         match self.status() {
             Some(status) => (400..500).contains(&status) && ![401, 403, 408, 429].contains(&status),
             None => false,
         }
     }
 
-    fn is_non_account_failure(&self) -> bool {
+    pub(crate) fn is_non_account_failure(&self) -> bool {
         matches!(self, Self::NonAccount(_))
     }
 
@@ -329,7 +329,14 @@ pub struct ClaudeSession {
 }
 
 impl AccountPool {
-    fn stamp_use(&mut self, provider: Provider, id: &str) {
+    #[must_use]
+    pub fn is_known(&self, provider: Provider, id: &str) -> bool {
+        self.pools
+            .get(&provider)
+            .is_some_and(|pool| pool.runtimes.contains_key(id))
+    }
+
+    pub fn stamp_use(&mut self, provider: Provider, id: &str) {
         self.use_counter += 1;
         let seq = self.use_counter;
         if let Some(rt) = self.pools.get_mut(&provider).and_then(|pool| pool.runtimes.get_mut(id)) {

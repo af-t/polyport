@@ -186,6 +186,61 @@ pub fn build_upstream_payload(params: &CallGeminiParams, project_id: &str) -> Va
     })
 }
 
+async fn execute_gemini_attempt(
+    client: &reqwest::Client,
+    account: Option<&GeminiAccount>,
+    upstream_payload: &Value,
+    class: ModelClass,
+    pool: &Arc<RwLock<AccountPool>>,
+    account_id: &str,
+) -> Result<GeminiStreamResult, AttemptError> {
+    let token = get_or_refresh_google_token(account, Some(client))
+        .await
+        .map_err(|e| AttemptError::Other(anyhow::anyhow!("Auth failed: {e}")))?;
+
+    let res = client
+        .post("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "antigravity/cli/1.0.6 linux/arm64")
+        .header("Content-Type", "application/json")
+        .json(upstream_payload)
+        .send()
+        .await
+        .map_err(|e| AttemptError::NonAccount(NonAccountError::new(e.to_string())))?;
+
+    let status = res.status().as_u16();
+    if !res.status().is_success() {
+        let headers = res.headers().clone();
+        let error_text = res.text().await.unwrap_or_default();
+        if is_rate_limit_status(status, &error_text) {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() * 1000 + u64::from(d.subsec_millis()));
+            let cooldown_ms = parse_cooldown_ms(&headers, &error_text, now_ms);
+            let until = now_ms + cooldown_ms;
+            pool.write()
+                .await
+                .mark_cooldown(Provider::Gemini, account_id, class, until);
+            return Err(AttemptError::RateLimit(RateLimitError { status, cooldown_ms }));
+        }
+        if (400..500).contains(&status) {
+            return Err(AttemptError::Upstream(UpstreamError::new(
+                status,
+                format!("Upstream client error ({status}): {error_text}"),
+            )));
+        }
+        return Err(AttemptError::Upstream(UpstreamError::new(
+            status,
+            format!("Upstream error ({status}): {error_text}"),
+        )));
+    }
+
+    Ok(GeminiStreamResult {
+        response: res,
+        account_id: account_id.to_string(),
+    })
+}
+
 /// Dispatches a streaming call to Gemini upstream using account failover.
 ///
 /// # Errors
@@ -209,56 +264,63 @@ pub async fn call_gemini_stream(
     let project_id = get_gcp_project_id();
     let upstream_payload = build_upstream_payload(params, &project_id);
 
-    {
-        let mut guard = pool.write().await;
-        let id_refs: Vec<&str> = accounts.iter().map(|a| a.id.as_str()).collect();
-        guard.sync_accounts(Provider::Gemini, &id_refs);
-    }
-
     let preferred = params.preferred_account_id.as_deref();
     let class = params.model_class;
 
-    let mut guard = pool.write().await;
-    guard
-        .with_failover(Provider::Gemini, class, preferred, async |account_id| {
-            let account = accounts.iter().find(|a| a.id == account_id);
-            let token = get_or_refresh_google_token(account, Some(client))
-                .await
-                .map_err(|e| AttemptError::Other(anyhow::anyhow!("Auth failed: {e}")))?;
+    let candidates: Vec<String> = {
+        let mut guard = pool.write().await;
+        let id_refs: Vec<&str> = accounts.iter().map(|a| a.id.as_str()).collect();
+        guard.sync_accounts(Provider::Gemini, &id_refs);
 
-            let res = client
-                .post("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse")
-                .header("Authorization", format!("Bearer {token}"))
-                .header("User-Agent", "antigravity/cli/1.0.6 linux/arm64")
-                .header("Content-Type", "application/json")
-                .json(&upstream_payload)
-                .send()
-                .await
-                .map_err(|e| AttemptError::NonAccount(NonAccountError::new(e.to_string())))?;
-
-            let status = res.status().as_u16();
-            if !res.status().is_success() {
-                let headers = res.headers().clone();
-                let error_text = res.text().await.unwrap_or_default();
-                if is_rate_limit_status(status, &error_text) {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs() * 1000 + u64::from(d.subsec_millis()));
-                    let cooldown_ms = parse_cooldown_ms(&headers, &error_text, now_ms);
-                    return Err(AttemptError::RateLimit(RateLimitError { status, cooldown_ms }));
-                }
-                return Err(AttemptError::Upstream(UpstreamError::new(
-                    status,
-                    format!("Upstream API error ({status}): {error_text}"),
-                )));
+        let mut ids: Vec<String> = Vec::new();
+        if let Some(pref) = preferred {
+            if !guard.is_known(Provider::Gemini, pref) {
+                return Err(AttemptError::RateLimit(RateLimitError {
+                    status: 429,
+                    cooldown_ms: 0,
+                }));
             }
+            ids.push(pref.to_string());
+        }
+        for id in guard.available_ids(Provider::Gemini, class) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    };
 
-            Ok(GeminiStreamResult {
-                response: res,
-                account_id: account_id.to_string(),
-            })
+    if candidates.is_empty() {
+        return Err(AttemptError::RateLimit(RateLimitError {
+            status: 429,
+            cooldown_ms: 0,
+        }));
+    }
+
+    let mut last_err = None;
+    for account_id in &candidates {
+        pool.write().await.stamp_use(Provider::Gemini, account_id);
+        let Some(account) = accounts.iter().find(|a| a.id == *account_id) else {
+            continue;
+        };
+
+        match execute_gemini_attempt(client, Some(account), &upstream_payload, class, pool, account_id).await {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                if err.is_deterministic_client_error() || err.is_non_account_failure() {
+                    return Err(err);
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        AttemptError::RateLimit(RateLimitError {
+            status: 429,
+            cooldown_ms: 0,
         })
-        .await
+    }))
 }
 
 #[cfg(test)]
