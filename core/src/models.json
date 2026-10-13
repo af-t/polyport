@@ -1,0 +1,210 @@
+[
+  {
+    "id": "gemini-3.5-flash",
+    "name": "Gemini 3.5 Flash",
+    "provider": "google",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"]
+  },
+  {
+    "id": "gemini-3.5-flash-lite",
+    "name": "Gemini 3.5 Flash-Lite",
+    "provider": "google",
+    "featured": true,
+    "thinking": true,
+    "effort": []
+  },
+  {
+    "id": "gemini-3.8-flash-tiered",
+    "name": "Gemini 3.8 Flash",
+    "provider": "google",
+    "featured": true,
+    "thinking": true,
+    "effort": []
+  },
+  {
+    "id": "claude-sonnet-5-native",
+    "name": "Claude Sonnet 5",
+    "provider": "anthropic",
+    "featured": true,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"]
+  },
+  {
+    "id": "claude-opus-4-8-native",
+    "name": "Claude Opus 4.8",
+    "provider": "anthropic",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"]
+  },
+  {
+    "id": "claude-opus-5-native",
+    "name": "Claude Opus 5",
+    "provider": "anthropic",
+    "featured": true,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"],
+    "modalities": {
+      "input": ["text", "image", "document"],
+      "output": ["text"]
+    }
+  },
+  {
+    "id": "gemini-3.1-pro",
+    "name": "Gemini 3.1 Pro",
+    "provider": "google",
+    "featured": true,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"],
+    "modalities": {
+      "input": ["text", "image", "video", "audio", "pdf"],
+      "output": ["text"]
+    },
+    "context_window": 1048576,
+    "max_output": 65535
+  },
+  {
+    "id": "gemini-3.6-flash",
+    "name": "Gemini 3.6 Flash",
+    "provider": "google",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high"],
+    "modalities": {
+      "input": ["text", "image", "video", "audio", "pdf"],
+      "output": ["text"]
+    },
+    "context_window": 1048576,
+    "max_output": 65536
+  },
+  {
+    "id": "gemini-3-flash",
+    "name": "Gemini 3 Flash",
+    "provider": "google",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"]
+  },
+  {
+    "id": "gpt-oss-120b-medium",
+    "name": "GPT-OSS 120B",
+    "provider": "google",
+    "featured": false,
+    "thinking": false,
+    "effort": []
+  },
+  {
+    "id": "claude-sonnet-4-6-native",
+    "name": "Claude Sonnet 4.6",
+    "provider": "anthropic",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "max"]
+  },
+  {
+    "id": "claude-sonnet-4-6",
+    "name": "Claude Sonnet 4.6",
+    "provider": "google",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"]
+  },
+  {
+    "id": "claude-opus-4-6-thinking",
+    "name": "Claude Opus 4.6",
+    "provider": "google",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"]
+  },
+  {
+    "id": "claude-opus-4-7-native",
+    "name": "Claude Opus 4.7",
+    "provider": "anthropic",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"]
+  },
+  {
+    "id": "claude-haiku-4-5-native",
+    "name": "Claude Haiku 4.5",
+    "provider": "anthropic",
+    "featured": false,
+    "thinking": false,
+    "effort": []
+  },
+  {
+    "id": "claude-fable-native",
+    "name": "Claude Fable",
+    "provider": "anthropic",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"]
+  },
+  {
+    "id": "gpt-5.6-sol",
+    "name": "GPT-5.6 Sol",
+    "provider": "codex",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"]
+  },
+  {
+    "id": "gpt-5.6-terra",
+    "name": "GPT-5.6 Terra",
+    "provider": "codex",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"]
+  },
+  {
+    "id": "gpt-5.6-luna",
+    "name": "GPT-5.6 Luna",
+    "provider": "codex",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"]
+  },
+  {
+    "id": "gpt-6-luna",
+    "name": "GPT-6 Luna",
+    "provider": "codex",
+    "featured": true,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh", "max"]
+  },
+  {
+    "id": "gpt-5.5",
+    "name": "GPT-5.5",
+    "provider": "codex",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh"]
+  },
+  {
+    "id": "gpt-5.4",
+    "name": "GPT-5.4",
+    "provider": "codex",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh"]
+  },
+  {
+    "id": "gpt-5.4-mini",
+    "name": "GPT-5.4 Mini",
+    "provider": "codex",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh"]
+  },
+  {
+    "id": "codex-auto-review",
+    "name": "Codex Auto Review",
+    "provider": "codex",
+    "featured": false,
+    "thinking": true,
+    "effort": ["low", "medium", "high", "xhigh"]
+  }
+]
