@@ -2,16 +2,365 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config::get_port;
 use crate::services::credentials::{
     ClaudeAccount, ClaudeOauth, derive_claude_account_id, get_claude_accounts, upsert_claude_account,
 };
+use crate::utils::anthropic_session::get_device_id;
 
 pub const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const CLAUDE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+pub const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+pub const CLAUDE_CODE_BILLING_MARKER: &str = "x-anthropic-billing-header:";
+pub const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
+
+pub const CLAUDE_CODE_BETAS: &[&str] = &[
+    "claude-code-20250219",
+    "oauth-2025-04-20",
+    "interleaved-thinking-2025-05-14",
+    "thinking-token-count-2026-05-13",
+    "context-management-2025-06-27",
+    "prompt-caching-scope-2026-01-05",
+    "mid-conversation-system-2026-04-07",
+    "advisor-tool-2026-03-01",
+    "effort-2025-11-24",
+    "extended-cache-ttl-2025-04-11",
+];
+
+#[must_use]
+pub fn get_claude_code_version() -> String {
+    std::env::var("POLYPORT_CLAUDE_CLI_VERSION").unwrap_or_else(|_| "2.1.181".to_string())
+}
+
+#[must_use]
+pub fn get_claude_code_user_agent() -> String {
+    format!("claude-cli/{} (external, cli)", get_claude_code_version())
+}
+
+#[must_use]
+pub fn map_anthropic_model(requested_model: &str) -> String {
+    let lower = requested_model.to_lowercase();
+    if lower.contains("fable") {
+        return "claude-fable-5".to_string();
+    }
+    if let Some(stripped) = lower.strip_suffix("-native") {
+        return stripped.to_string();
+    }
+    if lower.contains("opus-5") || lower.contains("opus5") {
+        return "claude-opus-5".to_string();
+    }
+    if lower.contains("opus-4-8") || lower.contains("opus-4.8") {
+        return "claude-opus-4-8".to_string();
+    }
+    if lower.contains("opus-4-7") || lower.contains("opus-4.7") {
+        return "claude-opus-4-7".to_string();
+    }
+    if lower.contains("opus-4-6") || lower.contains("opus-4.6") {
+        return "claude-opus-4-6".to_string();
+    }
+    if lower.contains("opus") {
+        return "claude-opus-5".to_string();
+    }
+    if lower.contains("haiku") {
+        return "claude-haiku-4-5-20251001".to_string();
+    }
+    if lower.contains("sonnet-5") || lower.contains("sonnet5") {
+        return "claude-sonnet-5".to_string();
+    }
+    "claude-sonnet-4-6".to_string()
+}
+
+#[must_use]
+pub fn normalize_anthropic_effort(effort: Option<&str>) -> Option<String> {
+    let raw = effort?.trim().to_lowercase();
+    if raw == "minimal" {
+        return Some("low".to_string());
+    }
+    if matches!(raw.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
+        Some(raw)
+    } else {
+        None
+    }
+}
+
+pub fn apply_thinking_constraints(body: &mut Value) {
+    let is_enabled = body
+        .get("thinking")
+        .is_some_and(|t| t.get("type").and_then(Value::as_str) != Some("disabled"));
+    if is_enabled {
+        let Some(obj) = body.as_object_mut() else {
+            return;
+        };
+        obj.insert("temperature".to_string(), Value::from(1));
+        obj.remove("top_p");
+        obj.remove("top_k");
+    }
+}
+
+fn extract_system_texts(system: &Value) -> Vec<String> {
+    match system {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|b| {
+                if let Value::String(s) = b {
+                    Some(s.clone())
+                } else if b.get("type").and_then(Value::as_str) == Some("text") {
+                    b.get("text").and_then(Value::as_str).map(ToString::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("text") {
+                map.get("text")
+                    .and_then(Value::as_str)
+                    .map(|s| vec![s.to_string()])
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[must_use]
+pub fn with_claude_code_identity(system: Option<&Value>) -> Vec<Value> {
+    if let Some(sys) = system {
+        let texts = extract_system_texts(sys);
+        if texts
+            .iter()
+            .any(|t| t.trim() == CLAUDE_CODE_IDENTITY || t.starts_with(CLAUDE_CODE_BILLING_MARKER))
+        {
+            return match sys {
+                Value::Array(arr) => arr.clone(),
+                Value::String(s) => vec![serde_json::json!({ "type": "text", "text": s })],
+                other => vec![other.clone()],
+            };
+        }
+    }
+
+    let mut blocks = vec![serde_json::json!({ "type": "text", "text": CLAUDE_CODE_IDENTITY })];
+    if let Some(sys) = system {
+        match sys {
+            Value::String(s) => {
+                if !s.trim().is_empty() {
+                    blocks.push(serde_json::json!({ "type": "text", "text": s }));
+                }
+            }
+            Value::Array(arr) => blocks.extend(arr.iter().cloned()),
+            other => blocks.push(other.clone()),
+        }
+    }
+    blocks
+}
+
+#[must_use]
+pub fn merge_anthropic_betas(client_beta: Option<&str>) -> String {
+    let mut betas: Vec<String> = CLAUDE_CODE_BETAS.iter().map(|s| (*s).to_string()).collect();
+    if let Some(cb) = client_beta {
+        for part in cb.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() && !betas.iter().any(|b| b == trimmed) {
+                betas.push(trimmed.to_string());
+            }
+        }
+    }
+    betas.join(",")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTtl {
+    FiveMinutes,
+    OneHour,
+    Off,
+}
+
+#[must_use]
+pub fn get_cache_ttl() -> CacheTtl {
+    let val = std::env::var("POLYPORT_CACHE_TTL")
+        .unwrap_or_else(|_| "5m".to_string())
+        .to_lowercase();
+    match val.as_str() {
+        "off" | "none" | "false" | "0" => CacheTtl::Off,
+        "1h" | "60m" => CacheTtl::OneHour,
+        _ => CacheTtl::FiveMinutes,
+    }
+}
+
+fn block_has_cache_control(b: &Value) -> bool {
+    b.is_object() && b.get("cache_control").is_some()
+}
+
+fn body_has_any_cache_control(body: &Value) -> bool {
+    let sys_has = body
+        .get("system")
+        .and_then(Value::as_array)
+        .is_some_and(|sys| sys.iter().any(block_has_cache_control));
+    if sys_has {
+        return true;
+    }
+    let tools_has = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|t| t.iter().any(block_has_cache_control));
+    if tools_has {
+        return true;
+    }
+    if let Some(msgs) = body.get("messages").and_then(Value::as_array) {
+        for m in msgs {
+            let parts_has = m
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|p| p.iter().any(block_has_cache_control));
+            if parts_has {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn mark_last_block(arr: &mut [Value], budget: &mut usize, marker: &Value) {
+    if *budget == 0 || arr.is_empty() {
+        return;
+    }
+    let Some(last) = arr.last_mut() else {
+        return;
+    };
+    let Some(obj) = last.as_object_mut() else {
+        return;
+    };
+    obj.insert("cache_control".to_string(), marker.clone());
+    *budget -= 1;
+}
+
+pub fn inject_claude_code_cache_control(body: &mut Value, ttl: CacheTtl) {
+    if ttl == CacheTtl::Off || !body.is_object() || body_has_any_cache_control(body) {
+        return;
+    }
+
+    let marker = if ttl == CacheTtl::OneHour {
+        serde_json::json!({ "type": "ephemeral", "ttl": "1h" })
+    } else {
+        serde_json::json!({ "type": "ephemeral" })
+    };
+
+    let mut budget = 4usize;
+    if let Some(sys) = body.get_mut("system").and_then(Value::as_array_mut) {
+        mark_last_block(sys, &mut budget, &marker);
+    } else if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        mark_last_block(tools, &mut budget, &marker);
+    }
+
+    if let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        let mut user_indices = Vec::new();
+        for (i, m) in msgs.iter().enumerate().rev() {
+            if m.get("role").and_then(Value::as_str) == Some("user") {
+                user_indices.push(i);
+                if user_indices.len() == 2 {
+                    break;
+                }
+            }
+        }
+
+        for idx in user_indices {
+            if budget == 0 {
+                break;
+            }
+            let msg = &mut msgs[idx];
+            if let Some(content_str) = msg.get("content").and_then(Value::as_str) {
+                let text_obj = serde_json::json!({ "type": "text", "text": content_str, "cache_control": marker });
+                msg["content"] = serde_json::json!([text_obj]);
+                budget -= 1;
+            } else if let Some(parts) = msg.get_mut("content").and_then(Value::as_array_mut) {
+                mark_last_block(parts, &mut budget, &marker);
+            }
+        }
+    }
+}
+
+#[must_use]
+pub fn build_claude_code_headers(
+    token: &str,
+    anthropic_version: Option<&str>,
+    client_beta: Option<&str>,
+    client_user_agent: Option<&str>,
+) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    let ua = match client_user_agent {
+        Some(s) if s.starts_with("claude-cli/") => s.to_string(),
+        _ => get_claude_code_user_agent(),
+    };
+
+    let insert = |h: &mut HeaderMap, k: &'static str, v: &str| {
+        if let Ok(val) = HeaderValue::from_str(v) {
+            h.insert(HeaderName::from_static(k), val);
+        }
+    };
+
+    insert(&mut map, "content-type", "application/json");
+    insert(&mut map, "accept", "application/json");
+    insert(&mut map, "anthropic-version", anthropic_version.unwrap_or("2023-06-01"));
+    insert(&mut map, "anthropic-beta", &merge_anthropic_betas(client_beta));
+    insert(&mut map, "anthropic-dangerous-direct-browser-access", "true");
+    insert(&mut map, "x-app", "cli");
+    insert(&mut map, "user-agent", &ua);
+    insert(&mut map, "authorization", &format!("Bearer {token}"));
+
+    insert(&mut map, "x-stainless-lang", "js");
+    insert(&mut map, "x-stainless-package-version", "0.94.0");
+    insert(
+        &mut map,
+        "x-stainless-os",
+        if cfg!(target_os = "macos") {
+            "MacOS"
+        } else if cfg!(target_os = "windows") {
+            "Windows"
+        } else {
+            "Linux"
+        },
+    );
+    insert(
+        &mut map,
+        "x-stainless-arch",
+        if cfg!(target_arch = "x86_64") {
+            "x64"
+        } else if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "Other"
+        },
+    );
+    insert(&mut map, "x-stainless-runtime", "node");
+    insert(&mut map, "x-stainless-runtime-version", "v24.3.0");
+    insert(&mut map, "x-stainless-retry-count", "0");
+    insert(&mut map, "x-stainless-timeout", "600");
+
+    map
+}
+
+pub fn stamp_claude_metadata(body: &mut Value, session_id: &str) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let metadata = obj.entry("metadata").or_insert_with(|| serde_json::json!({}));
+    if metadata.get("user_id").is_none() {
+        let user_id = serde_json::json!({
+            "device_id": get_device_id(),
+            "account_uuid": "",
+            "session_id": session_id,
+        });
+        metadata["user_id"] = Value::String(user_id.to_string());
+    }
+}
 
 static PENDING_VERIFIERS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 
@@ -297,5 +646,89 @@ mod tests {
         let saved = saved.unwrap();
         assert_eq!(saved.claude_ai_oauth.access_token, "access_123");
         assert_eq!(saved.claude_ai_oauth.refresh_token.as_deref(), Some("refresh_456"));
+    }
+
+    #[test]
+    fn test_map_anthropic_model() {
+        assert_eq!(
+            map_anthropic_model("claude-3-5-sonnet-20241022-native"),
+            "claude-3-5-sonnet-20241022"
+        );
+        assert_eq!(map_anthropic_model("claude-fable-something"), "claude-fable-5");
+        assert_eq!(map_anthropic_model("claude-opus-5"), "claude-opus-5");
+        assert_eq!(map_anthropic_model("claude-haiku"), "claude-haiku-4-5-20251001");
+        assert_eq!(map_anthropic_model("claude-sonnet-5"), "claude-sonnet-5");
+        assert_eq!(map_anthropic_model("unknown"), "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn test_normalize_anthropic_effort() {
+        assert_eq!(normalize_anthropic_effort(Some("minimal")), Some("low".to_string()));
+        assert_eq!(normalize_anthropic_effort(Some("high")), Some("high".to_string()));
+        assert_eq!(normalize_anthropic_effort(Some("NONE")), None);
+        assert_eq!(normalize_anthropic_effort(None), None);
+    }
+
+    #[test]
+    fn test_apply_thinking_constraints() {
+        let mut body = serde_json::json!({
+            "thinking": { "type": "enabled", "budget_tokens": 2048 },
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 40
+        });
+        apply_thinking_constraints(&mut body);
+        assert_eq!(body["temperature"], 1);
+        assert!(body.get("top_p").is_none());
+        assert!(body.get("top_k").is_none());
+    }
+
+    #[test]
+    fn test_with_claude_code_identity() {
+        let sys = serde_json::json!("Be friendly");
+        let blocks = with_claude_code_identity(Some(&sys));
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], CLAUDE_CODE_IDENTITY);
+        assert_eq!(blocks[1]["text"], "Be friendly");
+
+        // Idempotent if identity already present
+        let blocks_again = with_claude_code_identity(Some(&serde_json::Value::Array(blocks.clone())));
+        assert_eq!(blocks_again.len(), 2);
+    }
+
+    #[test]
+    fn test_inject_claude_code_cache_control() {
+        let mut body = serde_json::json!({
+            "system": [{ "type": "text", "text": "system prompt" }],
+            "messages": [
+                { "role": "user", "content": "hello" }
+            ]
+        });
+        inject_claude_code_cache_control(&mut body, CacheTtl::FiveMinutes);
+        assert!(body["system"][0].get("cache_control").is_some());
+        assert!(body["messages"][0]["content"][0].get("cache_control").is_some());
+    }
+
+    #[test]
+    fn test_build_claude_code_headers() {
+        let headers = build_claude_code_headers("token_123", None, None, None);
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer token_123");
+        assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+        assert!(
+            headers
+                .get("user-agent")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("claude-cli/")
+        );
+        assert!(
+            headers
+                .get("anthropic-beta")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("claude-code-20250219")
+        );
     }
 }
