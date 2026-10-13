@@ -27,6 +27,7 @@ uuid = { version = "1.28", features = ["v4"] }
 mime = "0.3"
 mime_guess = "2.0"
 rust-embed = "8.13"
+httpdate = "1"
 
 [lints.rust]
 warnings = "deny"
