@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ClaudeModelTier, find_model_info};
+use crate::config::{ClaudeModelTier, ModelNotFoundError, RouteDecision, find_model_info, resolve_route};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -177,6 +177,100 @@ pub fn load_model_mapping() -> LoadedModelMapping {
     read_mapping_from_path(&mapping_path())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteCandidate {
+    pub requested_model: String,
+    pub route: RouteDecision,
+    pub mapped: bool,
+}
+
+/// Resolves route candidates using an explicit mapping configuration.
+///
+/// # Errors
+/// Returns `ModelNotFoundError` if `requested_model` or any mapped target cannot be resolved.
+pub fn resolve_route_candidates_with_mapping(
+    requested_model: &str,
+    endpoint: MappingEndpoint,
+    effort: Option<&str>,
+    mapping: &LoadedModelMapping,
+) -> Result<Vec<RouteCandidate>, ModelNotFoundError> {
+    let original_route = resolve_route(requested_model, effort)?;
+    let model_info = find_model_info(requested_model);
+    let tier = model_info.and_then(|info| info.claude_tier);
+
+    let Some(tier) = tier else {
+        return Ok(vec![RouteCandidate {
+            requested_model: requested_model.to_string(),
+            route: original_route,
+            mapped: false,
+        }]);
+    };
+
+    if endpoint == MappingEndpoint::OpenAi && !mapping.include_openai {
+        return Ok(vec![RouteCandidate {
+            requested_model: requested_model.to_string(),
+            route: original_route,
+            mapped: false,
+        }]);
+    }
+
+    let Some(configured_targets) = mapping.targets.get(&tier) else {
+        return Ok(vec![RouteCandidate {
+            requested_model: requested_model.to_string(),
+            route: original_route,
+            mapped: false,
+        }]);
+    };
+
+    if configured_targets.is_empty() {
+        return Ok(vec![RouteCandidate {
+            requested_model: requested_model.to_string(),
+            route: original_route,
+            mapped: false,
+        }]);
+    }
+
+    let mut candidates = Vec::with_capacity(configured_targets.len());
+    for target in configured_targets {
+        let route = resolve_route(&target.model, effort)?;
+        candidates.push(RouteCandidate {
+            requested_model: requested_model.to_string(),
+            route,
+            mapped: true,
+        });
+    }
+
+    Ok(candidates)
+}
+
+/// Resolves route candidates using the default mapping file on disk.
+///
+/// # Errors
+/// Returns `ModelNotFoundError` if `requested_model` or any mapped target cannot be resolved.
+pub fn resolve_route_candidates(
+    requested_model: &str,
+    endpoint: MappingEndpoint,
+    effort: Option<&str>,
+) -> Result<Vec<RouteCandidate>, ModelNotFoundError> {
+    let mapping = load_model_mapping();
+    resolve_route_candidates_with_mapping(requested_model, endpoint, effort, &mapping)
+}
+
+#[must_use]
+pub fn get_route_fingerprint(candidates: &[RouteCandidate], endpoint: MappingEndpoint) -> Option<String> {
+    if !candidates.iter().any(|c| c.mapped) {
+        return None;
+    }
+
+    let joined = candidates
+        .iter()
+        .map(|c| format!("{}:{}", c.route.provider.as_str(), c.route.upstream_model))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    Some(format!("{}|{}", endpoint.as_str(), joined))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +377,109 @@ mod tests {
         assert_eq!(opus_targets.len(), 1);
         assert_eq!(opus_targets[0].provider, MappingProvider::Codex);
         assert_eq!(opus_targets[0].model, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn test_resolve_route_candidates_unmapped_for_non_claude_or_empty_mapping() {
+        let mapping = LoadedModelMapping::default();
+        let candidates =
+            resolve_route_candidates_with_mapping("gpt-5.5", MappingEndpoint::Messages, None, &mapping).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].requested_model, "gpt-5.5");
+        assert_eq!(candidates[0].route.provider, crate::types::Provider::Codex);
+        assert!(!candidates[0].mapped);
+    }
+
+    #[test]
+    fn test_resolve_route_candidates_mapped_claude_tier_preserves_requested_model() {
+        let mut mapping = LoadedModelMapping::default();
+        mapping.targets.insert(
+            ClaudeModelTier::Opus,
+            vec![
+                ModelMappingTarget {
+                    provider: MappingProvider::Google,
+                    model: "claude-opus-4-6-thinking".to_string(),
+                },
+                ModelMappingTarget {
+                    provider: MappingProvider::Codex,
+                    model: "gpt-5.6-sol".to_string(),
+                },
+            ],
+        );
+
+        let candidates =
+            resolve_route_candidates_with_mapping("claude-opus-4-8-native", MappingEndpoint::Messages, None, &mapping)
+                .unwrap();
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].requested_model, "claude-opus-4-8-native");
+        assert_eq!(candidates[0].route.provider, crate::types::Provider::Gemini);
+        assert_eq!(candidates[0].route.upstream_model, "claude-opus-4-6-thinking");
+        assert!(candidates[0].mapped);
+
+        assert_eq!(candidates[1].requested_model, "claude-opus-4-8-native");
+        assert_eq!(candidates[1].route.provider, crate::types::Provider::Codex);
+        assert_eq!(candidates[1].route.upstream_model, "gpt-5.6-sol");
+        assert!(candidates[1].mapped);
+    }
+
+    #[test]
+    fn test_resolve_route_candidates_openai_endpoint_honors_include_openai() {
+        let mut mapping = LoadedModelMapping::default();
+        mapping.targets.insert(
+            ClaudeModelTier::Sonnet,
+            vec![ModelMappingTarget {
+                provider: MappingProvider::Codex,
+                model: "gpt-5.6-terra".to_string(),
+            }],
+        );
+
+        // include_openai is false by default
+        let unmapped =
+            resolve_route_candidates_with_mapping("claude-sonnet-5-native", MappingEndpoint::OpenAi, None, &mapping)
+                .unwrap();
+        assert_eq!(unmapped.len(), 1);
+        assert!(!unmapped[0].mapped);
+        assert_eq!(unmapped[0].route.provider, crate::types::Provider::Claude);
+
+        // explicitly true
+        mapping.include_openai = true;
+        let mapped =
+            resolve_route_candidates_with_mapping("claude-sonnet-5-native", MappingEndpoint::OpenAi, None, &mapping)
+                .unwrap();
+        assert_eq!(mapped.len(), 1);
+        assert!(mapped[0].mapped);
+        assert_eq!(mapped[0].route.provider, crate::types::Provider::Codex);
+    }
+
+    #[test]
+    fn test_get_route_fingerprint_mapped_and_unmapped() {
+        let mut mapping = LoadedModelMapping::default();
+        mapping.targets.insert(
+            ClaudeModelTier::Opus,
+            vec![
+                ModelMappingTarget {
+                    provider: MappingProvider::Google,
+                    model: "claude-opus-4-6-thinking".to_string(),
+                },
+                ModelMappingTarget {
+                    provider: MappingProvider::Codex,
+                    model: "gpt-5.6-sol".to_string(),
+                },
+            ],
+        );
+
+        let mapped =
+            resolve_route_candidates_with_mapping("claude-opus-4-8-native", MappingEndpoint::Messages, None, &mapping)
+                .unwrap();
+        let fp = get_route_fingerprint(&mapped, MappingEndpoint::Messages);
+        assert_eq!(
+            fp.as_deref(),
+            Some("messages|gemini:claude-opus-4-6-thinking,codex:gpt-5.6-sol")
+        );
+
+        let unmapped =
+            resolve_route_candidates_with_mapping("gpt-5.5", MappingEndpoint::Messages, None, &mapping).unwrap();
+        assert_eq!(get_route_fingerprint(&unmapped, MappingEndpoint::Messages), None);
     }
 }
