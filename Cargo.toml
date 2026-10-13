@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "webui"]
+members = ["agent", "core", "webui"]
 default-members = ["webui"]
 
 [workspace.lints.rust]
