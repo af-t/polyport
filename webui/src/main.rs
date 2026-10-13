@@ -1,9 +1,17 @@
+use clap::Parser;
+use polyport_core::cli::{Cli, run_cli};
+
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-fn main() {
-    println!("polyport {}", version());
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    if let Err(err) = run_cli(cli).await {
+        eprintln!("polyport {} error: {err:#}", version());
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
