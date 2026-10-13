@@ -6,11 +6,16 @@ pub fn parse_gemini_sse_line(line: &str) -> Option<Value> {
     if !trimmed.starts_with("data: ") {
         return None;
     }
-    let data = &trimmed[6..].trim();
-    if *data == "[DONE]" {
+    let data = trimmed[6..].trim();
+    if data == "[DONE]" {
         return None;
     }
     serde_json::from_str::<Value>(data).ok()
+}
+
+#[must_use]
+pub fn parse_anthropic_sse_line(line: &str) -> Option<Value> {
+    parse_gemini_sse_line(line)
 }
 
 pub struct AnthropicStreamState {
@@ -244,6 +249,66 @@ pub fn gemini_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec
 }
 
 #[must_use]
+pub fn anthropic_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec<String> {
+    let mut events = Vec::new();
+    if !state.started {
+        state.started = true;
+        let start_chunk = serde_json::json!({
+            "id": &state.completion_id,
+            "object": "chat.completion.chunk",
+            "created": state.created,
+            "model": &state.model,
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": "" },
+                "finish_reason": serde_json::Value::Null
+            }]
+        });
+        events.push(format!("data: {start_chunk}\n\n"));
+    }
+
+    let chunk_type = chunk.get("type").and_then(Value::as_str).unwrap_or("");
+    if chunk_type == "content_block_delta" {
+        if let Some(text) = chunk.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str) {
+            let text_chunk = serde_json::json!({
+                "id": &state.completion_id,
+                "object": "chat.completion.chunk",
+                "created": state.created,
+                "model": &state.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": text },
+                    "finish_reason": serde_json::Value::Null
+                }]
+            });
+            events.push(format!("data: {text_chunk}\n\n"));
+        }
+    } else if (chunk_type == "message_stop" || chunk_type == "message_delta") && !state.finished {
+        let stop_reason = chunk
+            .get("delta")
+            .and_then(|d| d.get("stop_reason"))
+            .and_then(Value::as_str);
+        if stop_reason.is_some() || chunk_type == "message_stop" {
+            state.finished = true;
+            let finish_chunk = serde_json::json!({
+                "id": &state.completion_id,
+                "object": "chat.completion.chunk",
+                "created": state.created,
+                "model": &state.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            });
+            events.push(format!("data: {finish_chunk}\n\n"));
+            events.push("data: [DONE]\n\n".to_string());
+        }
+    }
+    events
+}
+
+#[must_use]
 pub fn collect_gemini_response(chunks: &[Value]) -> (String, Option<String>, u32, u32) {
     let mut full_text = String::new();
     let mut finish_reason = None;
@@ -371,5 +436,30 @@ mod tests {
         assert_eq!(finish_reason.as_deref(), Some("STOP"));
         assert_eq!(prompt_tokens, 5);
         assert_eq!(output_tokens, 2);
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_sse_events() {
+        let mut state = OpenAiStreamState::new("test-cmpl-anthropic", "claude-sonnet-5");
+        let delta_chunk = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "text_delta",
+                "text": "hello anthropic"
+            }
+        });
+        let stop_chunk = serde_json::json!({
+            "type": "message_stop"
+        });
+
+        let events1 = anthropic_to_openai_sse(&delta_chunk, &mut state);
+        let events2 = anthropic_to_openai_sse(&stop_chunk, &mut state);
+
+        let all_events = [events1, events2].concat();
+        let all_text = all_events.join("\n");
+        assert!(all_text.contains("chat.completion.chunk"));
+        assert!(all_text.contains("hello anthropic"));
+        assert!(all_text.contains("[DONE]"));
     }
 }
