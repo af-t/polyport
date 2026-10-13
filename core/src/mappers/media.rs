@@ -272,6 +272,48 @@ pub fn render_for_gemini(part: &MediaPart) -> Result<Value, MediaError> {
     Err(MediaError::UnsupportedMedia(format!("{:?}", part.kind)))
 }
 
+/// Renders a media part into Codex Responses input part format.
+///
+/// # Errors
+/// Returns `MediaError` if media cannot be rendered for Codex.
+pub fn render_for_codex(part: &MediaPart) -> Result<Value, MediaError> {
+    if part.kind == MediaKind::Image {
+        let url = if let Some(ref b64) = part.base64 {
+            format!("data:{};base64,{}", part.mime_type, b64)
+        } else if let Some(ref u) = part.url {
+            u.clone()
+        } else {
+            return Err(MediaError::UnsupportedMedia("image without source".to_string()));
+        };
+        return Ok(serde_json::json!({
+            "type": "input_image",
+            "image_url": url,
+        }));
+    }
+    if let Some(ref file_id) = part.file_id {
+        return Ok(serde_json::json!({
+            "type": "input_file",
+            "file_id": file_id,
+        }));
+    }
+    let filename = part.filename.as_deref().unwrap_or("document.pdf");
+    if let Some(ref b64) = part.base64 {
+        return Ok(serde_json::json!({
+            "type": "input_file",
+            "filename": filename,
+            "file_data": format!("data:{};base64,{}", part.mime_type, b64),
+        }));
+    }
+    if let Some(ref u) = part.url {
+        return Ok(serde_json::json!({
+            "type": "input_file",
+            "filename": filename,
+            "file_data": u,
+        }));
+    }
+    Err(MediaError::UnsupportedMedia(format!("{:?}", part.kind)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +376,33 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn test_render_for_codex_image_and_file() {
+        let part = MediaPart {
+            kind: MediaKind::Image,
+            mime_type: "image/png".to_string(),
+            base64: Some("pngbase64".to_string()),
+            url: None,
+            file_id: None,
+            filename: None,
+        };
+        let rendered = render_for_codex(&part).unwrap();
+        assert_eq!(rendered["type"], "input_image");
+        assert_eq!(rendered["image_url"], "data:image/png;base64,pngbase64");
+
+        let doc_part = MediaPart {
+            kind: MediaKind::Document,
+            mime_type: "application/pdf".to_string(),
+            base64: Some("pdfbase64".to_string()),
+            url: None,
+            file_id: None,
+            filename: Some("spec.pdf".to_string()),
+        };
+        let doc_rendered = render_for_codex(&doc_part).unwrap();
+        assert_eq!(doc_rendered["type"], "input_file");
+        assert_eq!(doc_rendered["filename"], "spec.pdf");
+        assert_eq!(doc_rendered["file_data"], "data:application/pdf;base64,pdfbase64");
     }
 }
