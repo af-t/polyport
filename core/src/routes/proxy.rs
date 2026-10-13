@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::app::AppState;
 use crate::config::RouteDecision;
 use crate::mappers::codex::{map_anthropic_to_responses, map_openai_to_responses};
-use crate::mappers::gemini::map_messages_to_gemini;
+use crate::mappers::gemini::{map_anthropic_tools_for_gemini, map_messages_to_gemini, map_openai_tools_for_gemini};
 use crate::model_mapping::{MappingEndpoint, resolve_route_candidates};
 use crate::services::account_pool::AttemptError;
 use crate::services::anthropic::{
@@ -116,7 +116,25 @@ fn handle_gemini_messages_stream(stream_res: GeminiStreamResult, model: &str) ->
 async fn handle_gemini_messages_buffered(stream_res: GeminiStreamResult, model: &str) -> Response {
     let full_body = stream_res.response.text().await.unwrap_or_default();
     let chunks: Vec<Value> = full_body.lines().filter_map(parse_gemini_sse_line).collect();
-    let (full_text, finish_reason, prompt_tokens, output_tokens) = collect_gemini_response(&chunks);
+    let res = collect_gemini_response(&chunks);
+
+    let mut content = Vec::new();
+    if !res.text.is_empty() {
+        content.push(serde_json::json!({ "type": "text", "text": res.text }));
+    }
+    let mut stop_reason = res.finish_reason.unwrap_or_else(|| "end_turn".to_string());
+    if !res.function_calls.is_empty() {
+        stop_reason = "tool_use".to_string();
+        for fc in res.function_calls {
+            content.push(serde_json::json!({
+                "type": "tool_use",
+                "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
+                "name": fc.name,
+                "input": fc.args,
+            }));
+        }
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -124,12 +142,12 @@ async fn handle_gemini_messages_buffered(stream_res: GeminiStreamResult, model: 
             "type": "message",
             "role": "assistant",
             "model": model,
-            "content": [{ "type": "text", "text": full_text }],
-            "stop_reason": finish_reason.unwrap_or_else(|| "end_turn".to_string()),
+            "content": content,
+            "stop_reason": stop_reason,
             "stop_sequence": serde_json::Value::Null,
             "usage": {
-                "input_tokens": prompt_tokens,
-                "output_tokens": output_tokens
+                "input_tokens": res.prompt_tokens,
+                "output_tokens": res.output_tokens,
             }
         })),
     )
@@ -174,7 +192,7 @@ async fn dispatch_gemini_messages(
             .collect(),
         system_instruction: system_instruction.map(|s| serde_json::to_value(s).unwrap_or_default()),
         generation_config,
-        tools: req.tools.clone(),
+        tools: req.tools.as_deref().and_then(map_anthropic_tools_for_gemini),
         tool_config: req.tool_choice.clone(),
         upstream_model: route.upstream_model.clone(),
         model_class: route.model_class,
@@ -440,10 +458,32 @@ fn handle_gemini_completions_stream(stream_res: GeminiStreamResult, model: &str)
 async fn handle_gemini_completions_buffered(stream_res: GeminiStreamResult, model: &str) -> Response {
     let full_body = stream_res.response.text().await.unwrap_or_default();
     let chunks: Vec<Value> = full_body.lines().filter_map(parse_gemini_sse_line).collect();
-    let (full_text, _finish_reason, prompt_tokens, output_tokens) = collect_gemini_response(&chunks);
+    let res = collect_gemini_response(&chunks);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+
+    let mut message = serde_json::json!({ "role": "assistant", "content": res.text });
+    let mut finish_reason = "stop";
+    if !res.function_calls.is_empty() {
+        finish_reason = "tool_calls";
+        let tool_calls: Vec<Value> = res
+            .function_calls
+            .iter()
+            .map(|fc| {
+                serde_json::json!({
+                    "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
+                    "type": "function",
+                    "function": {
+                        "name": fc.name,
+                        "arguments": serde_json::to_string(&fc.args).unwrap_or_default(),
+                    }
+                })
+            })
+            .collect();
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -453,13 +493,13 @@ async fn handle_gemini_completions_buffered(stream_res: GeminiStreamResult, mode
             "model": model,
             "choices": [{
                 "index": 0,
-                "message": { "role": "assistant", "content": full_text },
-                "finish_reason": "stop"
+                "message": message,
+                "finish_reason": finish_reason,
             }],
             "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": output_tokens,
-                "total_tokens": prompt_tokens + output_tokens
+                "prompt_tokens": res.prompt_tokens,
+                "completion_tokens": res.output_tokens,
+                "total_tokens": res.prompt_tokens + res.output_tokens,
             }
         })),
     )
@@ -499,7 +539,7 @@ async fn dispatch_gemini_completions(
             .collect(),
         system_instruction: system_instruction.map(|s| serde_json::to_value(s).unwrap_or_default()),
         generation_config,
-        tools: req.tools.clone(),
+        tools: req.tools.as_deref().and_then(map_openai_tools_for_gemini),
         tool_config: None,
         upstream_model: route.upstream_model.clone(),
         model_class: route.model_class,

@@ -227,6 +227,54 @@ pub fn map_messages_to_gemini(
     Ok((system_instruction, contents))
 }
 
+#[must_use]
+pub fn map_openai_tools_for_gemini(tools: &[Value]) -> Option<Vec<Value>> {
+    let mut declarations = Vec::new();
+    for t in tools {
+        if t.get("type").and_then(Value::as_str) == Some("function")
+            && let Some(f) = t.get("function")
+        {
+            let name = f.get("name").and_then(Value::as_str).unwrap_or("");
+            let description = f.get("description").and_then(Value::as_str).unwrap_or("");
+            let mut decl = serde_json::json!({
+                "name": name,
+                "description": description,
+            });
+            if let Some(params) = f.get("parameters") {
+                decl["parameters"] = params.clone();
+            }
+            declarations.push(decl);
+        }
+    }
+    if declarations.is_empty() {
+        None
+    } else {
+        Some(vec![serde_json::json!({ "functionDeclarations": declarations })])
+    }
+}
+
+#[must_use]
+pub fn map_anthropic_tools_for_gemini(tools: &[Value]) -> Option<Vec<Value>> {
+    let mut declarations = Vec::new();
+    for t in tools {
+        let name = t.get("name").and_then(Value::as_str).unwrap_or("");
+        let description = t.get("description").and_then(Value::as_str).unwrap_or("");
+        let mut decl = serde_json::json!({
+            "name": name,
+            "description": description,
+        });
+        if let Some(params) = t.get("input_schema") {
+            decl["parameters"] = params.clone();
+        }
+        declarations.push(decl);
+    }
+    if declarations.is_empty() {
+        None
+    } else {
+        Some(vec![serde_json::json!({ "functionDeclarations": declarations })])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

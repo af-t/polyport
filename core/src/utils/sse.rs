@@ -379,9 +379,25 @@ pub fn anthropic_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> 
     events
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeminiFunctionCall {
+    pub name: String,
+    pub args: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectedGemini {
+    pub text: String,
+    pub function_calls: Vec<GeminiFunctionCall>,
+    pub finish_reason: Option<String>,
+    pub prompt_tokens: u32,
+    pub output_tokens: u32,
+}
+
 #[must_use]
-pub fn collect_gemini_response(chunks: &[Value]) -> (String, Option<String>, u32, u32) {
+pub fn collect_gemini_response(chunks: &[Value]) -> CollectedGemini {
     let mut full_text = String::new();
+    let mut function_calls = Vec::new();
     let mut finish_reason = None;
     let mut prompt_tokens = 0;
     let mut output_tokens = 0;
@@ -416,12 +432,27 @@ pub fn collect_gemini_response(chunks: &[Value]) -> (String, Option<String>, u32
                     if let Some(t) = part.get("text").and_then(Value::as_str) {
                         full_text.push_str(t);
                     }
+                    if let Some(fc) = part.get("functionCall")
+                        && let Some(name) = fc.get("name").and_then(Value::as_str)
+                    {
+                        let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
+                        function_calls.push(GeminiFunctionCall {
+                            name: name.to_string(),
+                            args,
+                        });
+                    }
                 }
             }
         }
     }
 
-    (full_text, finish_reason, prompt_tokens, output_tokens)
+    CollectedGemini {
+        text: full_text,
+        function_calls,
+        finish_reason,
+        prompt_tokens,
+        output_tokens,
+    }
 }
 
 #[must_use]
@@ -714,11 +745,11 @@ mod tests {
             }
         });
 
-        let (text, finish_reason, prompt_tokens, output_tokens) = collect_gemini_response(&[chunk1, chunk2]);
-        assert_eq!(text, "foo bar");
-        assert_eq!(finish_reason.as_deref(), Some("STOP"));
-        assert_eq!(prompt_tokens, 5);
-        assert_eq!(output_tokens, 2);
+        let res = collect_gemini_response(&[chunk1, chunk2]);
+        assert_eq!(res.text, "foo bar");
+        assert_eq!(res.finish_reason.as_deref(), Some("STOP"));
+        assert_eq!(res.prompt_tokens, 5);
+        assert_eq!(res.output_tokens, 2);
     }
 
     #[test]
