@@ -449,6 +449,7 @@ mod tests {
 
     #[test]
     fn test_save_codex_token_data_persists_round_trip() {
+        let (_tmp, _guard) = crate::services::credentials::test_helpers::isolated_env("codex-save-user");
         let acc_id = "test-codex-user";
         save_codex_token_data(acc_id, "access_token_123", Some("refresh_token_456"), None, None, 3600).unwrap();
 

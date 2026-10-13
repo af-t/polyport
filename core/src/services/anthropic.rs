@@ -842,6 +842,7 @@ mod tests {
 
     #[test]
     fn test_save_claude_token_data_persists() {
+        let (_tmp, _guard) = crate::services::credentials::test_helpers::isolated_env("anthropic-save-claude");
         let acc_id = "test-claude-acc";
         save_claude_token_data(acc_id, "access_123", "refresh_456", 1_234_567_890).unwrap();
         let accounts = get_claude_accounts();

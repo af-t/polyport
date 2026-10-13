@@ -90,9 +90,30 @@ fn home_dir() -> PathBuf {
 
 #[must_use]
 pub fn get_credential_path() -> PathBuf {
+    let explicit_opt = std::env::var("POLYPORT_CREDENTIAL_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    if let Some(explicit) = explicit_opt {
+        return PathBuf::from(explicit);
+    }
     let root_cwd = std::env::var("POLYPORT_ROOT_CWD").unwrap_or_else(|_| ".".to_owned());
     let root_cwd = PathBuf::from(root_cwd);
     let local_override = root_cwd.join(".polyport.json");
+
+    #[cfg(test)]
+    {
+        let has_isolation = std::env::var_os("XDG_CONFIG_HOME").is_some()
+            || std::env::var_os("POLYPORT_ROOT_CWD").is_some()
+            || local_override.exists();
+        if !has_isolation {
+            return std::env::temp_dir()
+                .join("polyport-test-isolated-home")
+                .join(".config")
+                .join("polyport")
+                .join("credential.json");
+        }
+    }
+
     compute_credential_path(
         if std::env::consts::OS == "windows" {
             "win32"
@@ -373,7 +394,8 @@ pub fn derive_claude_account_id(email: Option<&str>, account_uuid: Option<&str>)
 }
 
 #[cfg(test)]
-mod test_helpers {
+#[allow(clippy::missing_panics_doc, clippy::must_use_candidate)]
+pub mod test_helpers {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, MutexGuard};
@@ -457,11 +479,20 @@ mod test_helpers {
         }
         out
     }
+
+    pub fn isolated_env(prefix: &str) -> (TempDir, EnvGuard) {
+        let tmp = TempDir::fresh(prefix);
+        let guard = EnvGuard::capture(&["HOME", "XDG_CONFIG_HOME", "POLYPORT_ROOT_CWD"]);
+        EnvGuard::set("HOME", tmp.path().to_str().unwrap());
+        EnvGuard::set("XDG_CONFIG_HOME", &tmp.path().join("config").to_string_lossy());
+        EnvGuard::set("POLYPORT_ROOT_CWD", tmp.path().to_str().unwrap());
+        (tmp, guard)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_helpers::{EnvGuard, TempDir, b64url_encode};
+    use super::test_helpers::{EnvGuard, TempDir, b64url_encode, isolated_env};
     use super::*;
     use std::path::{Path, PathBuf};
 
@@ -509,15 +540,6 @@ mod tests {
         let tmp = TempDir::fresh("cred-link");
         EnvGuard::set("POLYPORT_TEST_LINK", tmp.path().to_str().unwrap());
         assert_ne!(b64url_encode("link"), "");
-    }
-
-    fn isolated_env(prefix: &str) -> (TempDir, EnvGuard) {
-        let tmp = TempDir::fresh(prefix);
-        let guard = EnvGuard::capture(&["HOME", "XDG_CONFIG_HOME", "POLYPORT_ROOT_CWD"]);
-        EnvGuard::set("HOME", tmp.path().to_str().unwrap());
-        EnvGuard::set("XDG_CONFIG_HOME", &tmp.path().join("config").to_string_lossy());
-        EnvGuard::set("POLYPORT_ROOT_CWD", tmp.path().to_str().unwrap());
-        (tmp, guard)
     }
 
     #[test]

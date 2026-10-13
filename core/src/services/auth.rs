@@ -330,6 +330,7 @@ mod tests {
 
     #[test]
     fn test_save_token_data_persists_account() {
+        let (_tmp, _guard) = crate::services::credentials::test_helpers::isolated_env("auth-save-gemini");
         let account_id = "test-auth-save-gemini";
         save_token_data(account_id, "mock-access", Some("mock-refresh"), 3600).unwrap();
 
