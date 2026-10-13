@@ -1,17 +1,23 @@
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
 
 use crate::config::get_port;
+use crate::services::account_pool::{AccountPool, AttemptError};
 use crate::services::credentials::{
     ClaudeAccount, ClaudeOauth, derive_claude_account_id, get_claude_accounts, upsert_claude_account,
 };
-use crate::utils::anthropic_session::get_device_id;
+use crate::types::{ModelClass, Provider};
+use crate::utils::anthropic_session::{get_deterministic_session_id, get_device_id};
+use crate::utils::rate_limit::{
+    NonAccountError, RateLimitError, UpstreamError, is_rate_limit_status, parse_cooldown_ms,
+};
 
 pub const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const CLAUDE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
@@ -610,6 +616,198 @@ pub async fn get_claude_token(
     Ok(Some(oauth.access_token.clone()))
 }
 
+#[derive(Debug, Clone)]
+pub struct CallClaudeParams {
+    pub body: Value,
+    pub model_class: ModelClass,
+    pub preferred_account_id: Option<String>,
+    pub client_headers: Option<HeaderMap>,
+}
+
+#[derive(Debug)]
+pub struct ClaudeStreamResult {
+    pub response: reqwest::Response,
+    pub account_id: String,
+}
+
+async fn resolve_claude_candidates(
+    pool: &Arc<RwLock<AccountPool>>,
+    accounts: &[ClaudeAccount],
+    preferred: Option<&str>,
+    class: ModelClass,
+) -> Result<Vec<String>, AttemptError> {
+    let mut guard = pool.write().await;
+    let id_refs: Vec<&str> = accounts.iter().map(|a| a.id.as_str()).collect();
+    guard.sync_accounts(Provider::Claude, &id_refs);
+
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(pref) = preferred {
+        if !guard.is_known(Provider::Claude, pref) {
+            return Err(AttemptError::RateLimit(RateLimitError {
+                status: 429,
+                cooldown_ms: 0,
+            }));
+        }
+        ids.push(pref.to_string());
+    }
+    for id in guard.available_ids(Provider::Claude, class) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Err(AttemptError::RateLimit(RateLimitError {
+            status: 429,
+            cooldown_ms: 0,
+        }));
+    }
+    Ok(ids)
+}
+
+fn prepare_claude_attempt_headers(token: &str, client_headers: Option<&HeaderMap>) -> HeaderMap {
+    let client_ua = client_headers
+        .and_then(|h| h.get("user-agent"))
+        .and_then(|v| v.to_str().ok());
+    let anthropic_ver = client_headers
+        .and_then(|h| h.get("anthropic-version"))
+        .and_then(|v| v.to_str().ok());
+    let anthropic_beta = client_headers
+        .and_then(|h| h.get("anthropic-beta"))
+        .and_then(|v| v.to_str().ok());
+
+    let mut headers = build_claude_code_headers(token, anthropic_ver, anthropic_beta, client_ua);
+    if let Some(ch) = client_headers {
+        for (key, val) in ch {
+            let name = key.as_str();
+            if (name.starts_with("x-") || name.starts_with("anthropic-"))
+                && name != "anthropic-version"
+                && name != "anthropic-beta"
+                && name != "x-api-key"
+            {
+                headers.insert(key.clone(), val.clone());
+            }
+        }
+    }
+    headers
+}
+
+async fn execute_claude_attempt(
+    client: &reqwest::Client,
+    body: &Value,
+    headers: HeaderMap,
+    class: ModelClass,
+    pool: &Arc<RwLock<AccountPool>>,
+    account_id: &str,
+) -> Result<ClaudeStreamResult, AttemptError> {
+    let res = client
+        .post(ANTHROPIC_MESSAGES_URL)
+        .headers(headers)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| AttemptError::NonAccount(NonAccountError::new(e.to_string())))?;
+
+    let status = res.status().as_u16();
+    if !res.status().is_success() {
+        let headers = res.headers().clone();
+        let error_text = res.text().await.unwrap_or_default();
+        if is_rate_limit_status(status, &error_text) {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() * 1000 + u64::from(d.subsec_millis()));
+            let cooldown_ms = parse_cooldown_ms(&headers, &error_text, now_ms);
+            let until = now_ms + cooldown_ms;
+            pool.write()
+                .await
+                .mark_cooldown(Provider::Claude, account_id, class, until);
+            return Err(AttemptError::RateLimit(RateLimitError { status, cooldown_ms }));
+        }
+        if (400..500).contains(&status) {
+            return Err(AttemptError::Upstream(UpstreamError::new(
+                status,
+                format!("Upstream client error ({status}): {error_text}"),
+            )));
+        }
+        return Err(AttemptError::Upstream(UpstreamError::new(
+            status,
+            format!("Upstream error ({status}): {error_text}"),
+        )));
+    }
+
+    Ok(ClaudeStreamResult {
+        response: res,
+        account_id: account_id.to_string(),
+    })
+}
+
+/// Dispatches a streaming call to Claude upstream using account failover.
+///
+/// # Errors
+/// Returns `AttemptError` if failover exhausts or non-account failure occurs.
+pub async fn call_claude_stream(
+    params: &CallClaudeParams,
+    pool: &Arc<RwLock<AccountPool>>,
+    client: &reqwest::Client,
+) -> Result<ClaudeStreamResult, AttemptError> {
+    let accounts: Vec<ClaudeAccount> = get_claude_accounts()
+        .into_iter()
+        .filter(|a| !a.claude_ai_oauth.access_token.is_empty())
+        .collect();
+
+    if accounts.is_empty() {
+        return Err(AttemptError::NonAccount(NonAccountError::new(
+            "No configured Claude accounts found",
+        )));
+    }
+
+    let candidates = resolve_claude_candidates(
+        pool,
+        &accounts,
+        params.preferred_account_id.as_deref(),
+        params.model_class,
+    )
+    .await?;
+
+    let mut last_err = None;
+    for account_id in &candidates {
+        pool.write().await.stamp_use(Provider::Claude, account_id);
+        let Some(account) = accounts.iter().find(|a| a.id == *account_id) else {
+            continue;
+        };
+
+        let Ok(Some(token)) = get_claude_token(Some(account), Some(client)).await else {
+            last_err = Some(AttemptError::NonAccount(NonAccountError::new(
+                "Failed to acquire valid Claude access token",
+            )));
+            continue;
+        };
+
+        let mut request_body = params.body.clone();
+        let session_id = get_deterministic_session_id(&request_body);
+        stamp_claude_metadata(&mut request_body, &session_id);
+        inject_claude_code_cache_control(&mut request_body, get_cache_ttl());
+
+        let headers = prepare_claude_attempt_headers(&token, params.client_headers.as_ref());
+
+        match execute_claude_attempt(client, &request_body, headers, params.model_class, pool, account_id).await {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                if err.is_deterministic_client_error() || err.is_non_account_failure() {
+                    return Err(err);
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        AttemptError::RateLimit(RateLimitError {
+            status: 429,
+            cooldown_ms: 0,
+        })
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,5 +928,23 @@ mod tests {
                 .unwrap()
                 .contains("claude-code-20250219")
         );
+    }
+
+    #[tokio::test]
+    async fn test_call_claude_stream_fails_with_unknown_preferred_account() {
+        let pool = Arc::new(RwLock::new(AccountPool::default()));
+        let client = reqwest::Client::new();
+        let params = CallClaudeParams {
+            body: serde_json::json!({
+                "model": "claude-sonnet-5",
+                "messages": [{ "role": "user", "content": "hi" }]
+            }),
+            model_class: ModelClass::Claude,
+            preferred_account_id: Some("non-existent-account-id".to_string()),
+            client_headers: None,
+        };
+
+        let res = call_claude_stream(&params, &pool, &client).await;
+        assert!(res.is_err());
     }
 }
