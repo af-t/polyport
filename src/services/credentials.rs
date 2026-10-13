@@ -190,7 +190,11 @@ pub fn get_gemini_accounts() -> Vec<GeminiAccount> {
 
 #[must_use]
 pub fn get_claude_accounts() -> Vec<ClaudeAccount> {
-    let creds = read_credentials().unwrap_or_default();
+    claude_accounts_in(&read_credentials().unwrap_or_default())
+}
+
+#[must_use]
+pub fn claude_accounts_in(creds: &Credentials) -> Vec<ClaudeAccount> {
     accounts_in(creds.claude.as_ref())
         .iter()
         .filter_map(|v| serde_json::from_value(v.clone()).ok())
