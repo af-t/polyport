@@ -1312,6 +1312,7 @@ dependencies = [
 name = "polyport-agent"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "ignore",
  "reqwest",
  "serde",
@@ -1319,6 +1320,7 @@ dependencies = [
  "sha3",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
