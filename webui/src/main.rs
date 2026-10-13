@@ -1,6 +1,9 @@
 use clap::Parser;
 use polyport_core::cli::{Cli, run_cli};
 
+#[allow(dead_code)]
+mod static_files;
+
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
