@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::app::AppState;
 use crate::config::RouteDecision;
+use crate::mappers::codex::{map_anthropic_to_responses, map_openai_to_responses};
 use crate::mappers::gemini::map_messages_to_gemini;
 use crate::model_mapping::{MappingEndpoint, resolve_route_candidates};
 use crate::services::account_pool::AttemptError;
@@ -15,11 +16,13 @@ use crate::services::anthropic::{
     CallClaudeParams, ClaudeStreamResult, apply_thinking_constraints, call_claude_stream, map_anthropic_model,
     with_claude_code_identity,
 };
+use crate::services::codex::{CallCodexParams, CodexStreamResult, call_codex_stream};
 use crate::services::gemini::{CallGeminiParams, GeminiStreamResult, build_generation_config, call_gemini_stream};
 use crate::types::{ModelClass, Provider};
 use crate::utils::sse::{
-    AnthropicStreamState, OpenAiStreamState, anthropic_to_openai_sse, collect_gemini_response, gemini_to_anthropic_sse,
-    gemini_to_openai_sse, parse_anthropic_sse_line, parse_gemini_sse_line,
+    AnthropicStreamState, OpenAiStreamState, anthropic_to_openai_sse, codex_to_anthropic_sse, codex_to_openai_sse,
+    collect_codex_response, collect_gemini_response, gemini_to_anthropic_sse, gemini_to_openai_sse,
+    parse_anthropic_sse_line, parse_codex_sse_line, parse_gemini_sse_line,
 };
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -208,6 +211,100 @@ async fn dispatch_claude_messages(
     }
 }
 
+fn handle_codex_messages_stream(stream_res: CodexStreamResult, model: &str) -> Response {
+    let (mut tx, rx) = futures::channel::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+    let model_name = model.to_string();
+    tokio::spawn(async move {
+        let mut stream = stream_res.response.bytes_stream();
+        let mut buffer = String::new();
+        let mut sse_state = AnthropicStreamState::new(&format!("msg_{}", uuid::Uuid::new_v4()), &model_name);
+        while let Some(Ok(bytes)) = stream.next().await {
+            if let Ok(chunk_str) = std::str::from_utf8(&bytes) {
+                buffer.push_str(chunk_str);
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].to_string();
+                    buffer.drain(..=pos);
+                    if let Some(parsed) = parse_codex_sse_line(&line) {
+                        let events = codex_to_anthropic_sse(&parsed, &mut sse_state);
+                        for ev in events {
+                            let _ = tx.send(Ok(axum::body::Bytes::from(ev))).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    let body = axum::body::Body::from_stream(rx);
+    Response::builder()
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .body(body)
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
+}
+
+async fn handle_codex_messages_buffered(stream_res: CodexStreamResult, model: &str) -> Response {
+    let full_body = stream_res.response.text().await.unwrap_or_default();
+    let chunks: Vec<Value> = full_body.lines().filter_map(parse_codex_sse_line).collect();
+    let (full_text, _finish_reason, prompt_tokens, output_tokens) = collect_codex_response(&chunks);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": format!("msg_{}", uuid::Uuid::new_v4()),
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [{ "type": "text", "text": full_text }],
+            "stop_reason": "end_turn",
+            "stop_sequence": serde_json::Value::Null,
+            "usage": {
+                "input_tokens": prompt_tokens,
+                "output_tokens": output_tokens
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn dispatch_codex_messages(
+    state: &AppState,
+    req: &MessagesRequest,
+    upstream_model: &str,
+    model_class: ModelClass,
+) -> Response {
+    let raw_val = serde_json::to_value(req).unwrap_or_default();
+    let responses_body = match map_anthropic_to_responses(&raw_val, Some(upstream_model)) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": { "message": e.to_string(), "type": "invalid_request_error" }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let params = CallCodexParams {
+        body: responses_body,
+        model_class,
+        preferred_account_id: None,
+        conversation_id: None,
+    };
+
+    let model_name = req.model.as_deref().unwrap_or(upstream_model);
+    match call_codex_stream(&params, &state.pool, &state.http_client).await {
+        Ok(stream_res) => {
+            if req.stream.unwrap_or(false) {
+                handle_codex_messages_stream(stream_res, model_name)
+            } else {
+                handle_codex_messages_buffered(stream_res, model_name).await
+            }
+        }
+        Err(err) => attempt_error_to_response(&err),
+    }
+}
+
 pub async fn v1_messages_handler(
     State(state): State<AppState>,
     body: Result<Json<MessagesRequest>, axum::extract::rejection::JsonRejection>,
@@ -266,13 +363,15 @@ pub async fn v1_messages_handler(
             )
             .await
         }
-        Provider::Codex => (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({
-                "error": { "message": "Provider not yet connected", "type": "not_implemented" }
-            })),
-        )
-            .into_response(),
+        Provider::Codex => {
+            dispatch_codex_messages(
+                &state,
+                &req,
+                &candidate.route.upstream_model,
+                candidate.route.model_class,
+            )
+            .await
+        }
     }
 }
 
@@ -522,6 +621,106 @@ async fn dispatch_claude_completions(
     }
 }
 
+fn handle_codex_completions_stream(stream_res: CodexStreamResult, model: &str) -> Response {
+    let (mut tx, rx) = futures::channel::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+    let model_name = model.to_string();
+    tokio::spawn(async move {
+        let mut stream = stream_res.response.bytes_stream();
+        let mut buffer = String::new();
+        let mut sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), &model_name);
+        while let Some(Ok(bytes)) = stream.next().await {
+            if let Ok(chunk_str) = std::str::from_utf8(&bytes) {
+                buffer.push_str(chunk_str);
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].to_string();
+                    buffer.drain(..=pos);
+                    if let Some(parsed) = parse_codex_sse_line(&line) {
+                        let events = codex_to_openai_sse(&parsed, &mut sse_state);
+                        for ev in events {
+                            let _ = tx.send(Ok(axum::body::Bytes::from(ev))).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    let body = axum::body::Body::from_stream(rx);
+    Response::builder()
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .body(body)
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
+}
+
+async fn handle_codex_completions_buffered(stream_res: CodexStreamResult, model: &str) -> Response {
+    let full_body = stream_res.response.text().await.unwrap_or_default();
+    let chunks: Vec<Value> = full_body.lines().filter_map(parse_codex_sse_line).collect();
+    let (full_text, _finish_reason, prompt_tokens, output_tokens) = collect_codex_response(&chunks);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            "object": "chat.completion",
+            "created": now,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": full_text },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": prompt_tokens + output_tokens
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn dispatch_codex_completions(
+    state: &AppState,
+    req: &CompletionsRequest,
+    upstream_model: &str,
+    model_class: ModelClass,
+) -> Response {
+    let raw_val = serde_json::to_value(req).unwrap_or_default();
+    let responses_body = match map_openai_to_responses(&raw_val, Some(upstream_model)) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": { "message": e.to_string(), "type": "invalid_request_error" }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let params = CallCodexParams {
+        body: responses_body,
+        model_class,
+        preferred_account_id: None,
+        conversation_id: None,
+    };
+
+    let model_name = req.model.as_deref().unwrap_or(upstream_model);
+    match call_codex_stream(&params, &state.pool, &state.http_client).await {
+        Ok(stream_res) => {
+            if req.stream.unwrap_or(false) {
+                handle_codex_completions_stream(stream_res, model_name)
+            } else {
+                handle_codex_completions_buffered(stream_res, model_name).await
+            }
+        }
+        Err(err) => attempt_error_to_response(&err),
+    }
+}
+
 pub async fn v1_chat_completions_handler(
     State(state): State<AppState>,
     body: Result<Json<CompletionsRequest>, axum::extract::rejection::JsonRejection>,
@@ -580,13 +779,15 @@ pub async fn v1_chat_completions_handler(
             )
             .await
         }
-        Provider::Codex => (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({
-                "error": { "message": "Provider not yet connected", "type": "not_implemented" }
-            })),
-        )
-            .into_response(),
+        Provider::Codex => {
+            dispatch_codex_completions(
+                &state,
+                &req,
+                &candidate.route.upstream_model,
+                candidate.route.model_class,
+            )
+            .await
+        }
     }
 }
 
@@ -702,6 +903,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_messages_handler_routes_and_dispatches_codex() {
+        let state = AppState::default();
+        let app = create_app(state);
+
+        let req = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "gpt-5.5",
+                    "messages": [{ "role": "user", "content": "hi" }]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_ne!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn test_completions_handler_routes_and_dispatches_gemini() {
         let state = AppState::default();
         let app = create_app(state);
@@ -735,6 +958,28 @@ mod tests {
             .body(Body::from(
                 serde_json::json!({
                     "model": "claude-sonnet-5-native",
+                    "messages": [{ "role": "user", "content": "hi" }]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_ne!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_completions_handler_routes_and_dispatches_codex() {
+        let state = AppState::default();
+        let app = create_app(state);
+
+        let req = Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "gpt-5.5",
                     "messages": [{ "role": "user", "content": "hi" }]
                 })
                 .to_string(),
