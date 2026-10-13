@@ -1,14 +1,24 @@
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
+use serde_json::Value;
+use tokio::sync::RwLock;
 
+use crate::services::account_pool::{AccountPool, AttemptError};
 use crate::services::credentials::{
     CodexAccount, CodexTokens, decode_chatgpt_account_id, decode_oidc_account_id, get_codex_accounts,
     upsert_codex_account,
 };
+use crate::types::{ModelClass, Provider};
+use crate::utils::rate_limit::{
+    NonAccountError, RateLimitError, UpstreamError, is_rate_limit_status, parse_cooldown_ms,
+};
 
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+pub const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
 fn url_encode(input: &str) -> String {
     use std::fmt::Write;
@@ -213,6 +223,191 @@ pub async fn get_codex_token(
     Ok(Some(access_token.clone()))
 }
 
+#[derive(Debug, Clone)]
+pub struct CallCodexParams {
+    pub body: Value,
+    pub model_class: ModelClass,
+    pub preferred_account_id: Option<String>,
+    pub conversation_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct CodexStreamResult {
+    pub response: reqwest::Response,
+    pub account_id: String,
+}
+
+async fn resolve_codex_candidates(
+    pool: &Arc<RwLock<AccountPool>>,
+    accounts: &[CodexAccount],
+    preferred: Option<&str>,
+    class: ModelClass,
+) -> Result<Vec<String>, AttemptError> {
+    let mut guard = pool.write().await;
+    let id_refs: Vec<&str> = accounts.iter().map(|a| a.id.as_str()).collect();
+    guard.sync_accounts(Provider::Codex, &id_refs);
+
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(pref) = preferred {
+        if !guard.is_known(Provider::Codex, pref) {
+            return Err(AttemptError::RateLimit(RateLimitError {
+                status: 429,
+                cooldown_ms: 0,
+            }));
+        }
+        ids.push(pref.to_string());
+    }
+    for id in guard.available_ids(Provider::Codex, class) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Err(AttemptError::RateLimit(RateLimitError {
+            status: 429,
+            cooldown_ms: 0,
+        }));
+    }
+    Ok(ids)
+}
+
+fn prepare_codex_headers(token: &str, account: &CodexAccount, conversation_id: Option<&str>) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    let insert = |h: &mut HeaderMap, k: &'static str, v: &str| {
+        if let Ok(val) = HeaderValue::from_str(v) {
+            h.insert(HeaderName::from_static(k), val);
+        }
+    };
+
+    insert(&mut map, "content-type", "application/json");
+    insert(&mut map, "accept", "text/event-stream");
+    insert(&mut map, "originator", "codex_cli_rs");
+    insert(&mut map, "authorization", &format!("Bearer {token}"));
+
+    if let (Some("chatgpt"), Some(act_id)) = (account.auth_method.as_deref(), &account.tokens.account_id) {
+        insert(&mut map, "chatgpt-account-id", act_id);
+    }
+
+    if let Some(cid) = conversation_id {
+        insert(&mut map, "session-id", cid);
+        insert(&mut map, "thread-id", cid);
+    }
+
+    map
+}
+
+async fn execute_codex_attempt(
+    client: &reqwest::Client,
+    body: &Value,
+    headers: HeaderMap,
+    class: ModelClass,
+    pool: &Arc<RwLock<AccountPool>>,
+    account_id: &str,
+) -> Result<CodexStreamResult, AttemptError> {
+    let res = client
+        .post(CODEX_RESPONSES_URL)
+        .headers(headers)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| AttemptError::NonAccount(NonAccountError::new(e.to_string())))?;
+
+    let status = res.status().as_u16();
+    if !res.status().is_success() {
+        let headers = res.headers().clone();
+        let error_text = res.text().await.unwrap_or_default();
+        if is_rate_limit_status(status, &error_text) {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() * 1000 + u64::from(d.subsec_millis()));
+            let cooldown_ms = parse_cooldown_ms(&headers, &error_text, now_ms);
+            let until = now_ms + cooldown_ms;
+            pool.write()
+                .await
+                .mark_cooldown(Provider::Codex, account_id, class, until);
+            return Err(AttemptError::RateLimit(RateLimitError { status, cooldown_ms }));
+        }
+        if (400..500).contains(&status) {
+            return Err(AttemptError::Upstream(UpstreamError::new(
+                status,
+                format!("Upstream client error ({status}): {error_text}"),
+            )));
+        }
+        return Err(AttemptError::Upstream(UpstreamError::new(
+            status,
+            format!("Upstream error ({status}): {error_text}"),
+        )));
+    }
+
+    Ok(CodexStreamResult {
+        response: res,
+        account_id: account_id.to_string(),
+    })
+}
+
+/// Dispatches a streaming call to Codex Responses API upstream using account failover.
+///
+/// # Errors
+/// Returns `AttemptError` if failover exhausts or non-account failure occurs.
+pub async fn call_codex_stream(
+    params: &CallCodexParams,
+    pool: &Arc<RwLock<AccountPool>>,
+    client: &reqwest::Client,
+) -> Result<CodexStreamResult, AttemptError> {
+    let accounts: Vec<CodexAccount> = get_codex_accounts()
+        .into_iter()
+        .filter(|a| a.tokens.access_token.is_some() || a.openai_api_key.is_some())
+        .collect();
+
+    if accounts.is_empty() {
+        return Err(AttemptError::NonAccount(NonAccountError::new(
+            "No configured Codex accounts found",
+        )));
+    }
+
+    let candidates = resolve_codex_candidates(
+        pool,
+        &accounts,
+        params.preferred_account_id.as_deref(),
+        params.model_class,
+    )
+    .await?;
+
+    let mut last_err = None;
+    for account_id in &candidates {
+        pool.write().await.stamp_use(Provider::Codex, account_id);
+        let Some(account) = accounts.iter().find(|a| a.id == *account_id) else {
+            continue;
+        };
+
+        let Ok(Some(token)) = get_codex_token(Some(account), Some(client)).await else {
+            last_err = Some(AttemptError::NonAccount(NonAccountError::new(
+                "Failed to acquire valid Codex access token",
+            )));
+            continue;
+        };
+
+        let headers = prepare_codex_headers(&token, account, params.conversation_id.as_deref());
+
+        match execute_codex_attempt(client, &params.body, headers, params.model_class, pool, account_id).await {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                if err.is_deterministic_client_error() || err.is_non_account_failure() {
+                    return Err(err);
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        AttemptError::RateLimit(RateLimitError {
+            status: 429,
+            cooldown_ms: 0,
+        })
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +434,23 @@ mod tests {
         let saved = saved.unwrap();
         assert_eq!(saved.tokens.access_token.as_deref(), Some("access_token_123"));
         assert_eq!(saved.tokens.refresh_token.as_deref(), Some("refresh_token_456"));
+    }
+
+    #[tokio::test]
+    async fn test_call_codex_stream_fails_with_unknown_preferred_account() {
+        let pool = Arc::new(RwLock::new(AccountPool::default()));
+        let client = reqwest::Client::new();
+        let params = CallCodexParams {
+            body: serde_json::json!({
+                "model": "gpt-5.5",
+                "input": []
+            }),
+            model_class: ModelClass::Codex,
+            preferred_account_id: Some("non-existent-account-id".to_string()),
+            conversation_id: None,
+        };
+
+        let res = call_codex_stream(&params, &pool, &client).await;
+        assert!(res.is_err());
     }
 }

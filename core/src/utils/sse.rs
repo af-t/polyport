@@ -18,6 +18,11 @@ pub fn parse_anthropic_sse_line(line: &str) -> Option<Value> {
     parse_gemini_sse_line(line)
 }
 
+#[must_use]
+pub fn parse_codex_sse_line(line: &str) -> Option<Value> {
+    parse_gemini_sse_line(line)
+}
+
 pub struct AnthropicStreamState {
     pub msg_id: String,
     pub model: String,
@@ -353,6 +358,154 @@ pub fn collect_gemini_response(chunks: &[Value]) -> (String, Option<String>, u32
     (full_text, finish_reason, prompt_tokens, output_tokens)
 }
 
+#[must_use]
+pub fn codex_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec<String> {
+    let mut events = Vec::new();
+    if !state.started {
+        state.started = true;
+        let start_chunk = serde_json::json!({
+            "id": &state.completion_id,
+            "object": "chat.completion.chunk",
+            "created": state.created,
+            "model": &state.model,
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": "" },
+                "finish_reason": serde_json::Value::Null
+            }]
+        });
+        events.push(format!("data: {start_chunk}\n\n"));
+    }
+
+    let chunk_type = chunk.get("type").and_then(Value::as_str).unwrap_or("");
+    if chunk_type == "response.output_text.delta" {
+        if let Some(text) = chunk.get("delta").and_then(Value::as_str) {
+            let text_chunk = serde_json::json!({
+                "id": &state.completion_id,
+                "object": "chat.completion.chunk",
+                "created": state.created,
+                "model": &state.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": text },
+                    "finish_reason": serde_json::Value::Null
+                }]
+            });
+            events.push(format!("data: {text_chunk}\n\n"));
+        }
+    } else if chunk_type == "response.completed" && !state.finished {
+        state.finished = true;
+        let finish_chunk = serde_json::json!({
+            "id": &state.completion_id,
+            "object": "chat.completion.chunk",
+            "created": state.created,
+            "model": &state.model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        });
+        events.push(format!("data: {finish_chunk}\n\n"));
+        events.push("data: [DONE]\n\n".to_string());
+    }
+    events
+}
+
+#[must_use]
+pub fn codex_to_anthropic_sse(chunk: &Value, state: &mut AnthropicStreamState) -> Vec<String> {
+    let mut events = Vec::new();
+
+    if !state.started {
+        state.started = true;
+        let start_event = serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": &state.msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": &state.model,
+                "content": [],
+                "stop_reason": serde_json::Value::Null,
+                "stop_sequence": serde_json::Value::Null,
+                "usage": {
+                    "input_tokens": state.input_tokens,
+                    "output_tokens": 0
+                }
+            }
+        });
+        events.push(format!("event: message_start\ndata: {start_event}\n\n"));
+    }
+
+    let chunk_type = chunk.get("type").and_then(Value::as_str).unwrap_or("");
+    if chunk_type == "response.output_text.delta" {
+        if !state.text_block_started {
+            state.text_block_started = true;
+            let block_start = serde_json::json!({
+                "type": "content_block_start",
+                "index": state.block_index,
+                "content_block": { "type": "text", "text": "" }
+            });
+            events.push(format!("event: content_block_start\ndata: {block_start}\n\n"));
+        }
+        if let Some(text) = chunk.get("delta").and_then(Value::as_str) {
+            let delta = serde_json::json!({
+                "type": "content_block_delta",
+                "index": state.block_index,
+                "delta": { "type": "text_delta", "text": text }
+            });
+            events.push(format!("event: content_block_delta\ndata: {delta}\n\n"));
+        }
+    } else if chunk_type == "response.completed" && !state.finished {
+        state.finished = true;
+        if state.text_block_started {
+            let block_stop = serde_json::json!({
+                "type": "content_block_stop",
+                "index": state.block_index
+            });
+            events.push(format!("event: content_block_stop\ndata: {block_stop}\n\n"));
+        }
+        let msg_delta = serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "end_turn", "stop_sequence": serde_json::Value::Null },
+            "usage": { "output_tokens": state.output_tokens }
+        });
+        events.push(format!("event: message_delta\ndata: {msg_delta}\n\n"));
+        events.push("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string());
+    }
+
+    events
+}
+
+#[must_use]
+pub fn collect_codex_response(chunks: &[Value]) -> (String, Option<String>, u32, u32) {
+    let mut full_text = String::new();
+    let mut input_tokens = 0;
+    let mut output_tokens = 0;
+
+    for chunk in chunks {
+        let chunk_type = chunk.get("type").and_then(Value::as_str).unwrap_or("");
+        if chunk_type == "response.output_text.delta" {
+            if let Some(t) = chunk.get("delta").and_then(Value::as_str) {
+                full_text.push_str(t);
+            }
+        } else if chunk_type == "response.completed" {
+            let usage_opt = chunk.get("response").and_then(|r| r.get("usage"));
+            if let Some(usage) = usage_opt {
+                input_tokens = usage
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .map_or(0, |v| u32::try_from(v).unwrap_or(0));
+                output_tokens = usage
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .map_or(0, |v| u32::try_from(v).unwrap_or(0));
+            }
+        }
+    }
+    (full_text, Some("stop".to_string()), input_tokens, output_tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +614,44 @@ mod tests {
         assert!(all_text.contains("chat.completion.chunk"));
         assert!(all_text.contains("hello anthropic"));
         assert!(all_text.contains("[DONE]"));
+    }
+
+    #[test]
+    fn test_codex_to_openai_sse_events() {
+        let mut state = OpenAiStreamState::new("test-cmpl-codex", "gpt-5.5");
+        let delta = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "codex output"
+        });
+        let done = serde_json::json!({
+            "type": "response.completed"
+        });
+
+        let events1 = codex_to_openai_sse(&delta, &mut state);
+        let events2 = codex_to_openai_sse(&done, &mut state);
+
+        let all = [events1, events2].concat().join("\n");
+        assert!(all.contains("codex output"));
+        assert!(all.contains("[DONE]"));
+    }
+
+    #[test]
+    fn test_codex_to_anthropic_sse_events() {
+        let mut state = AnthropicStreamState::new("test-msg-codex", "gpt-5.5");
+        let delta = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "codex anthropic text"
+        });
+        let done = serde_json::json!({
+            "type": "response.completed"
+        });
+
+        let events1 = codex_to_anthropic_sse(&delta, &mut state);
+        let events2 = codex_to_anthropic_sse(&done, &mut state);
+
+        let all = [events1, events2].concat().join("\n");
+        assert!(all.contains("message_start"));
+        assert!(all.contains("codex anthropic text"));
+        assert!(all.contains("message_stop"));
     }
 }
