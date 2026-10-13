@@ -28,8 +28,12 @@ pub fn create_app(state: AppState) -> Router {
         .route("/v1/models", get(models::models_handler))
         .route("/api/v1/models", get(models::models_handler))
         .route("/oauth2callback", get(oauth::oauth_callback_handler))
+        .route("/callback", get(oauth::claude_callback_handler))
+        .route("/auth/callback", get(oauth::codex_callback_handler))
         .route("/v1/messages", post(proxy::v1_messages_handler))
+        .route("/api/v1/messages", post(proxy::v1_messages_handler))
         .route("/v1/chat/completions", post(proxy::v1_chat_completions_handler))
+        .route("/api/v1/chat/completions", post(proxy::v1_chat_completions_handler))
         .with_state(state)
 }
 
@@ -83,5 +87,32 @@ mod tests {
 
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_callback_routes_and_api_v1_aliases_registered() {
+        let state = AppState::default();
+        let app = create_app(state);
+
+        let endpoints = [
+            ("/callback", "GET"),
+            ("/auth/callback", "GET"),
+            ("/api/v1/messages", "POST"),
+            ("/api/v1/chat/completions", "POST"),
+        ];
+
+        for (uri, method) in endpoints {
+            let body = if method == "POST" {
+                Body::from("{}")
+            } else {
+                Body::empty()
+            };
+            let mut req = Request::builder().uri(uri).method(method);
+            if method == "POST" {
+                req = req.header("Content-Type", "application/json");
+            }
+            let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+            assert_ne!(resp.status(), StatusCode::NOT_FOUND, "Failed for {uri}");
+        }
     }
 }

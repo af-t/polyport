@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -19,6 +20,29 @@ use crate::utils::rate_limit::{
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+
+static PENDING_CODEX_VERIFIERS: Mutex<VecDeque<(String, String)>> = Mutex::new(VecDeque::new());
+
+pub fn store_codex_verifier(state: &str, verifier: &str) {
+    if let Ok(mut lock) = PENDING_CODEX_VERIFIERS.lock() {
+        if lock.len() >= 100 {
+            lock.pop_front();
+        }
+        lock.push_back((state.to_string(), verifier.to_string()));
+    }
+}
+
+#[must_use]
+pub fn get_stored_codex_verifier(state: Option<&str>) -> Option<String> {
+    let mut lock = PENDING_CODEX_VERIFIERS.lock().ok()?;
+    if let Some(s) = state {
+        let pos_opt = lock.iter().position(|(k, _)| k == s);
+        if let Some(pos) = pos_opt {
+            return lock.remove(pos).map(|(_, v)| v);
+        }
+    }
+    lock.pop_back().map(|(_, v)| v)
+}
 
 fn url_encode(input: &str) -> String {
     use std::fmt::Write;
