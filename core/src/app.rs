@@ -2,9 +2,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 
-use crate::routes::{health, models, oauth};
+use crate::routes::{health, models, oauth, proxy};
 use crate::services::account_pool::AccountPool;
 
 #[derive(Clone)]
@@ -28,6 +28,8 @@ pub fn create_app(state: AppState) -> Router {
         .route("/v1/models", get(models::models_handler))
         .route("/api/v1/models", get(models::models_handler))
         .route("/oauth2callback", get(oauth::oauth_callback_handler))
+        .route("/v1/messages", post(proxy::v1_messages_handler))
+        .route("/v1/chat/completions", post(proxy::v1_chat_completions_handler))
         .with_state(state)
 }
 
