@@ -289,7 +289,10 @@ async fn run_login(provider: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_start(args: &StartArgs) -> anyhow::Result<()> {
+/// # Errors
+/// Returns error for invalid port, invalid cache TTL, or sandbox setup failure.
+#[allow(clippy::unused_async)]
+pub async fn prepare_start(args: &StartArgs) -> anyhow::Result<u16> {
     if let Some(port) = args.port {
         if port == 0 {
             anyhow::bail!("Invalid port: {port}");
@@ -332,13 +335,23 @@ async fn run_start(args: &StartArgs) -> anyhow::Result<()> {
         println!("[Codex Auth] Codex credentials missing. Run: polyport login codex");
     }
 
-    let port = get_port();
-    let state = AppState::default();
-    let app = create_app(state);
+    Ok(get_port())
+}
+
+/// # Errors
+/// Returns error if the TCP bind or serve fails.
+pub async fn serve_router(app: axum::Router, port: u16) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
     println!("Listening on http://localhost:{port}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn run_start(args: &StartArgs) -> anyhow::Result<()> {
+    let port = prepare_start(args).await?;
+    let state = AppState::default();
+    let app = create_app(state);
+    serve_router(app, port).await
 }
 
 /// # Errors
@@ -376,6 +389,29 @@ pub async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Restore {
+        cwd: Option<std::path::PathBuf>,
+        port: Option<String>,
+        proxy_only: Option<String>,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.port {
+                    Some(v) => std::env::set_var("PORT", v),
+                    None => std::env::remove_var("PORT"),
+                }
+                match &self.proxy_only {
+                    Some(v) => std::env::set_var("POLYPORT_PROXY_ONLY", v),
+                    None => std::env::remove_var("POLYPORT_PROXY_ONLY"),
+                }
+            }
+            if let Some(cwd) = &self.cwd {
+                let _ = std::env::set_current_dir(cwd);
+            }
+        }
+    }
 
     #[test]
     fn test_empty_argv_defaults_to_start() {
@@ -440,5 +476,30 @@ mod tests {
         assert!(status.contains("Gemini accounts"));
         assert!(status.contains("Claude accounts"));
         assert!(status.contains("Codex accounts"));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_start_sets_port_env() {
+        let saved_cwd = std::env::current_dir().ok();
+        let saved_port = std::env::var("PORT").ok();
+        let saved_proxy_only = std::env::var("POLYPORT_PROXY_ONLY").ok();
+        let _restore = Restore {
+            cwd: saved_cwd,
+            port: saved_port,
+            proxy_only: saved_proxy_only,
+        };
+        unsafe {
+            std::env::remove_var("PORT");
+        }
+        let port = prepare_start(&StartArgs {
+            port: Some(19191),
+            proxy_only: true,
+            sandbox: Some("/tmp/polyport-plan-w1".into()),
+            cache_ttl: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(port, 19191);
+        assert_eq!(std::env::var("PORT").unwrap(), "19191");
     }
 }
