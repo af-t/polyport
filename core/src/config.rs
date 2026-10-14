@@ -114,6 +114,19 @@ pub static SUPPORTED_MODELS: &[ModelInfo] = &[
         default_effort: Some("medium"),
     },
     ModelInfo {
+        id: "gemini-3.8-flash",
+        owned_by: "google",
+        upstream_name: "gemini-3.8-flash-high",
+        model_class: Some(ModelClass::GeminiNative),
+        claude_tier: None,
+        upstream_by_effort: Some(&[
+            ("low", "gemini-3.8-flash-low"),
+            ("medium", "gemini-3.8-flash-medium"),
+            ("high", "gemini-3.8-flash-high"),
+        ]),
+        default_effort: Some("high"),
+    },
+    ModelInfo {
         id: "gemini-3-flash",
         owned_by: "google",
         upstream_name: "gemini-3-flash",
@@ -527,6 +540,25 @@ mod tests {
         assert_eq!(max_gemini_output_tokens("gemini-3.1-pro"), 65_535);
         assert_eq!(max_gemini_output_tokens("gemini-pro-agent"), 65_535);
         assert_eq!(max_gemini_output_tokens("gemini-3.5-flash"), 65_536);
+        assert_eq!(max_gemini_output_tokens("gemini-3.8-flash-high"), 65_536);
+    }
+
+    #[test]
+    fn test_resolve_route_gemini_38_flash_default_high() {
+        let route = resolve_route("gemini-3.8-flash", None).unwrap();
+        assert_eq!(route.provider, crate::types::Provider::Gemini);
+        assert_eq!(route.model_class, crate::types::ModelClass::GeminiNative);
+        assert_eq!(route.upstream_model, "gemini-3.8-flash-high");
+    }
+
+    #[test]
+    fn test_resolve_route_gemini_38_flash_effort_tiers() {
+        let low = resolve_route("gemini-3.8-flash", Some("low")).unwrap();
+        assert_eq!(low.upstream_model, "gemini-3.8-flash-low");
+        let medium = resolve_route("gemini-3.8-flash", Some("medium")).unwrap();
+        assert_eq!(medium.upstream_model, "gemini-3.8-flash-medium");
+        let high = resolve_route("gemini-3.8-flash", Some("high")).unwrap();
+        assert_eq!(high.upstream_model, "gemini-3.8-flash-high");
     }
 
     #[test]

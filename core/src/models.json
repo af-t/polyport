@@ -80,6 +80,20 @@
     "max_output": 65536
   },
   {
+    "id": "gemini-3.8-flash",
+    "name": "Gemini 3.8 Flash",
+    "provider": "google",
+    "featured": true,
+    "thinking": true,
+    "effort": ["low", "medium", "high"],
+    "modalities": {
+      "input": ["text", "image", "video", "audio", "pdf"],
+      "output": ["text"]
+    },
+    "context_window": 1048576,
+    "max_output": 65536
+  },
+  {
     "id": "gemini-3-flash",
     "name": "Gemini 3 Flash",
     "provider": "google",

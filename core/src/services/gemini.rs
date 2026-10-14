@@ -201,7 +201,7 @@ async fn execute_gemini_attempt(
     let res = client
         .post("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse")
         .header("Authorization", format!("Bearer {token}"))
-        .header("User-Agent", "antigravity/cli/1.0.6 linux/arm64")
+        .header("User-Agent", "antigravity/cli/1.3.5 linux/arm64")
         .header("Content-Type", "application/json")
         .json(upstream_payload)
         .send()
