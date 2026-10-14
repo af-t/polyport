@@ -20,9 +20,19 @@ use crate::services::credentials::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "polyport", version, about = "Polyport AI proxy server")]
+#[command(
+    name = "polyport",
+    version,
+    about = "Anthropic-compatible proxy for Gemini, Claude, and Codex",
+    long_about = "Anthropic-compatible proxy for Gemini, Claude, and Codex.\n\nPolyport serves an Anthropic-compatible API backed by Gemini, Claude, and Codex accounts, with an optional Web UI.\n\nExamples:\n  polyport\n  polyport start --port 9000\n  polyport login gemini\n  polyport status"
+)]
 pub struct Cli {
-    #[arg(long = "log-level", global = true)]
+    #[arg(
+        long = "log-level",
+        global = true,
+        value_name = "LEVEL",
+        help = "Log verbosity: trace|debug|info|warn|error|off (also LOG_LEVEL, default info)"
+    )]
     pub log_level: Option<String>,
 
     #[command(subcommand)]
@@ -31,28 +41,54 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Commands {
+    #[command(about = "Start the proxy server + Web UI (default)")]
     Start(StartArgs),
+    #[command(about = "Log in to a provider (gemini | claude | codex)")]
     Login {
+        #[arg(value_name = "PROVIDER", help = "Provider to log in to: gemini|claude|codex")]
         provider: String,
     },
+    #[command(about = "Log out (gemini | claude | codex | all)")]
     Logout {
+        #[arg(value_name = "PROVIDER", help = "Provider to log out from: gemini|claude|codex|all")]
         provider: String,
+        #[arg(
+            value_name = "ACCOUNT_ID",
+            help = "Account ID to remove (omit to clear the provider)"
+        )]
         account_id: Option<String>,
     },
+    #[command(about = "Show auth status, port, sandbox and cache usage")]
     Status,
 }
 
 #[derive(Debug, clap::Args, PartialEq, Eq)]
 pub struct StartArgs {
-    #[arg(short, long)]
+    #[arg(short, long, value_name = "PORT", help = "Port to bind (default: env PORT or 9000)")]
     pub port: Option<u16>,
-    #[arg(long = "proxy-only", default_value_t = false)]
+    #[arg(
+        long = "proxy-only",
+        default_value_t = false,
+        help = "API proxy only; do not serve the Web UI"
+    )]
     pub proxy_only: bool,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Sandbox working directory (default: ./sandbox; relative paths resolve against cwd)"
+    )]
     pub sandbox: Option<String>,
-    #[arg(long = "cache-ttl")]
+    #[arg(
+        long = "cache-ttl",
+        value_name = "TTL",
+        help = "Prompt-cache breakpoint TTL for Anthropic requests: 5m (default), 1h, or off"
+    )]
     pub cache_ttl: Option<String>,
-    #[arg(long = "log-level")]
+    #[arg(
+        long = "log-level",
+        value_name = "LEVEL",
+        help = "Log verbosity (overrides global --log-level)"
+    )]
     pub log_level: Option<String>,
 }
 
@@ -366,34 +402,56 @@ async fn run_start(args: &StartArgs) -> anyhow::Result<()> {
     serve_router(app, port).await
 }
 
+/// Returns the effective log level, preferring the subcommand flag over the global flag.
+#[must_use]
+pub fn effective_log_level<'a>(global: Option<&'a str>, scoped: Option<&'a str>) -> Option<&'a str> {
+    scoped.or(global)
+}
+
 /// # Errors
 /// Returns error if server, login exchange, or logout operation fails.
 pub async fn run_cli(cli: Cli) -> anyhow::Result<()> {
-    crate::logging::init_logging(cli.log_level.as_deref());
-    match cli.command {
+    let Cli { log_level, command } = cli;
+    match command {
         None => {
+            crate::logging::init_logging(log_level.as_deref());
             run_start(&StartArgs {
                 port: None,
                 proxy_only: false,
                 sandbox: None,
                 cache_ttl: None,
-                log_level: cli.log_level,
+                log_level,
             })
             .await
         }
-        Some(Commands::Start(args)) => run_start(&args).await,
-        Some(Commands::Login { provider }) => run_login(&provider).await,
-        Some(Commands::Logout { provider, account_id }) => match run_logout(&provider, account_id.as_deref()) {
-            Ok(msg) => {
-                println!("{msg}");
-                Ok(())
+        Some(Commands::Start(args)) => {
+            let level = effective_log_level(log_level.as_deref(), args.log_level.as_deref());
+            crate::logging::init_logging(level);
+            let merged = StartArgs {
+                log_level: level.map(str::to_string),
+                ..args
+            };
+            run_start(&merged).await
+        }
+        Some(Commands::Login { provider }) => {
+            crate::logging::init_logging(log_level.as_deref());
+            run_login(&provider).await
+        }
+        Some(Commands::Logout { provider, account_id }) => {
+            crate::logging::init_logging(log_level.as_deref());
+            match run_logout(&provider, account_id.as_deref()) {
+                Ok(msg) => {
+                    println!("{msg}");
+                    Ok(())
+                }
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    anyhow::bail!("{msg}");
+                }
             }
-            Err(msg) => {
-                eprintln!("{msg}");
-                anyhow::bail!("{msg}");
-            }
-        },
+        }
         Some(Commands::Status) => {
+            crate::logging::init_logging(log_level.as_deref());
             println!("{}", render_status());
             Ok(())
         }
@@ -489,6 +547,39 @@ mod tests {
         assert!(!challenge.contains('+'));
         assert!(!challenge.contains('/'));
         assert_eq!(challenge.len(), 43);
+    }
+
+    #[test]
+    fn test_effective_log_level_prefers_scoped() {
+        assert_eq!(effective_log_level(Some("info"), Some("debug")), Some("debug"));
+        assert_eq!(effective_log_level(Some("info"), None), Some("info"));
+        assert_eq!(effective_log_level(None, None), None);
+    }
+
+    #[test]
+    fn test_help_mentions_commands_and_options() {
+        use clap::CommandFactory;
+        let mut help = Vec::new();
+        Cli::command().write_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        for needle in ["start", "login", "logout", "status", "--log-level"] {
+            assert!(help.contains(needle), "help missing {needle}:\n{help}");
+        }
+    }
+
+    #[test]
+    fn test_start_help_describes_options() {
+        use clap::CommandFactory;
+        let mut help = Vec::new();
+        Cli::command()
+            .find_subcommand_mut("start")
+            .unwrap()
+            .write_help(&mut help)
+            .unwrap();
+        let help = String::from_utf8(help).unwrap();
+        for needle in ["--port", "--proxy-only", "--sandbox", "--cache-ttl", "--log-level"] {
+            assert!(help.contains(needle), "start help missing {needle}:\n{help}");
+        }
     }
 
     #[test]

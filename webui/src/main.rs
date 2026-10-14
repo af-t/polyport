@@ -15,18 +15,16 @@ fn version() -> &'static str {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    polyport_core::logging::init_logging(cli.log_level.as_deref());
-    match cli.command {
-        None | Some(Commands::Start(_)) => {
-            let args = match cli.command {
-                Some(Commands::Start(args)) => args,
-                _ => StartArgs {
-                    port: None,
-                    proxy_only: false,
-                    sandbox: None,
-                    cache_ttl: None,
-                    log_level: cli.log_level,
-                },
+    let Cli { log_level, command } = cli;
+    match command {
+        None => {
+            polyport_core::logging::init_logging(log_level.as_deref());
+            let args = StartArgs {
+                port: None,
+                proxy_only: false,
+                sandbox: None,
+                cache_ttl: None,
+                log_level,
             };
             let port = prepare_start(&args).await?;
             let proxy_only = args.proxy_only || std::env::var("POLYPORT_PROXY_ONLY").is_ok_and(|v| v == "1");
@@ -38,8 +36,29 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             serve_router(app, port).await?;
             Ok(())
         }
-        _ => {
-            run_cli(cli).await?;
+        Some(Commands::Start(args)) => {
+            let level = polyport_core::cli::effective_log_level(log_level.as_deref(), args.log_level.as_deref());
+            polyport_core::logging::init_logging(level);
+            let args = StartArgs {
+                log_level: level.map(str::to_string),
+                ..args
+            };
+            let port = prepare_start(&args).await?;
+            let proxy_only = args.proxy_only || std::env::var("POLYPORT_PROXY_ONLY").is_ok_and(|v| v == "1");
+            let sandbox_root = std::env::current_dir()?;
+            let core_state = AppState::default();
+            let ui_state = UiState { asset_dir: None };
+            let file_state = FileState { sandbox_root };
+            let app = build_webui_app(core_state, ui_state, file_state, proxy_only);
+            serve_router(app, port).await?;
+            Ok(())
+        }
+        other => {
+            run_cli(Cli {
+                log_level,
+                command: other,
+            })
+            .await?;
             Ok(())
         }
     }
