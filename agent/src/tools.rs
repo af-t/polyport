@@ -400,8 +400,8 @@ const MAX_WRITE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SEARCH_BYTES: u64 = 1024 * 1024;
 const DEFAULT_PAGE_LINES: usize = 1500;
 
-/// Dispatch a tool call by name. File tools are implemented here; the
-/// remaining five return `Failed("unknown tool: ...")` until later tasks.
+/// Dispatch a tool call by name. File tools and `runShell` are implemented
+/// here; the remaining four return `Failed("unknown tool: ...")` until later tasks.
 ///
 /// # Errors
 ///
@@ -414,6 +414,7 @@ pub async fn execute_tool(name: &str, input: &serde_json::Value, ctx: &ToolCtx) 
         "editFile" => exec_edit_file(input, ctx).await,
         "findFiles" => exec_find_files(input, ctx),
         "listFiles" => exec_list_files(input, ctx),
+        "runShell" => exec_run_shell(input, ctx).await,
         _ => Err(ToolError::Failed(format!("unknown tool: {name}"))),
     }
 }
@@ -879,6 +880,117 @@ fn exec_list_files(input: &serde_json::Value, ctx: &ToolCtx) -> Result<String, T
     }
 }
 
+const MAX_SHELL_OUTPUT_BYTES: usize = 32 * 1024;
+
+// Env keep-list: no *_TOKEN, *_KEY, or *_SECRET name is exempt; PATH and other harmless vars pass through.
+const SHELL_ENV_KEEP: &[&str] = &[];
+
+fn is_secret_env_key(key: &str) -> bool {
+    if SHELL_ENV_KEEP.contains(&key) {
+        return false;
+    }
+    let upper = key.to_ascii_uppercase();
+    upper.ends_with("_TOKEN") || upper.ends_with("_KEY") || upper.ends_with("_SECRET")
+}
+
+async fn read_pipe<R>(pipe: Option<R>) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await;
+    }
+    buf
+}
+
+#[cfg(windows)]
+fn build_shell(cmd: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("cmd");
+    command.arg("/C").arg(cmd);
+    command
+}
+
+#[cfg(not(windows))]
+fn build_shell(cmd: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("sh");
+    command.arg("-c").arg(cmd);
+    command
+}
+
+/// Run `cmd` in the foreground shell with cwd jailed to the sandbox root.
+///
+/// Stdout and stderr are merged and truncated to 32KB. Overrunning `timeout_secs`
+/// kills the child and returns `Failed` containing "timed out".
+///
+/// # Errors
+///
+/// Returns `ToolError::Failed` for empty commands, spawn failures, or timeouts.
+pub async fn run_shell_checked(ctx: &ToolCtx, cmd: &str, timeout_secs: u64) -> Result<String, ToolError> {
+    if cmd.trim().is_empty() {
+        return Err(ToolError::Failed("runShell: empty command".to_string()));
+    }
+    tokio::fs::create_dir_all(&ctx.sandbox_root)
+        .await
+        .map_err(|err| ToolError::Failed(format!("runShell: sandbox root unavailable: {err}")))?;
+    let mut command = build_shell(cmd);
+    command
+        .current_dir(&ctx.sandbox_root)
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    for (key, value) in std::env::vars() {
+        if !is_secret_env_key(&key) {
+            command.env(&key, &value);
+        }
+    }
+    let mut child = command.spawn().map_err(|err| ToolError::Failed(err.to_string()))?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let run = async {
+        let stdout_task = tokio::spawn(read_pipe(stdout_pipe));
+        let stderr_task = tokio::spawn(read_pipe(stderr_pipe));
+        child.wait().await.map_err(|err| ToolError::Failed(err.to_string()))?;
+        let stdout = stdout_task.await.map_err(|err| ToolError::Failed(err.to_string()))?;
+        let stderr = stderr_task.await.map_err(|err| ToolError::Failed(err.to_string()))?;
+        Ok::<(Vec<u8>, Vec<u8>), ToolError>((stdout, stderr))
+    };
+    let (stdout, stderr) = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run).await {
+        Ok(Ok((stdout, stderr))) => (stdout, stderr),
+        Ok(Err(err)) => return Err(err),
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(ToolError::Failed(format!("runShell: timed out after {timeout_secs}s")));
+        }
+    };
+    let mut merged = String::from_utf8_lossy(&stdout).into_owned();
+    merged.push_str(&String::from_utf8_lossy(&stderr));
+    if merged.len() > MAX_SHELL_OUTPUT_BYTES {
+        let mut end = MAX_SHELL_OUTPUT_BYTES;
+        while !merged.is_char_boundary(end) {
+            end -= 1;
+        }
+        merged.truncate(end);
+    }
+    Ok(merged)
+}
+
+async fn exec_run_shell(input: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
+    let cmd = input
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolError::Failed("runShell: missing 'command'".to_string()))?;
+    let timeout_secs = input
+        .get("timeout_secs")
+        .and_then(num_value)
+        .or_else(|| input.get("timeout").and_then(num_value).map(|ms| ms.div_ceil(1000)))
+        .unwrap_or(ctx.shell_timeout_secs);
+    run_shell_checked(ctx, cmd, timeout_secs).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1094,15 +1206,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_shell_echo_and_timeout() {
+        let ctx = ToolCtx::test_in(&tempfile::tempdir().unwrap());
+        let out = execute_tool("runShell", &json!({"command":"echo hello"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("hello"));
+    }
+
+    #[tokio::test]
     async fn test_unknown_tool_failed() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ToolCtx::test_in(&dir);
         let err = execute_tool("teleport", &json!({}), &ctx).await.unwrap_err();
         assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("unknown tool")));
-        let err = execute_tool("runShell", &json!({"command": "echo hi"}), &ctx)
+        let err = execute_tool("fetchUrl", &json!({"url": "https://example.com"}), &ctx)
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("unknown tool")));
+    }
+
+    #[tokio::test]
+    async fn test_shell_empty_command_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let err = run_shell_checked(&ctx, "", 5).await.unwrap_err();
+        assert!(matches!(err, ToolError::Failed(_)));
+        let err = run_shell_checked(&ctx, "   ", 5).await.unwrap_err();
+        assert!(matches!(err, ToolError::Failed(_)));
+        let err = execute_tool("runShell", &json!({"command": ""}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(_)));
+        let err = execute_tool("runShell", &json!({}), &ctx).await.unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("missing 'command'")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_timeout_kills_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let err = run_shell_checked(&ctx, "sleep 30", 1).await.unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("timed out")));
+        let err = execute_tool("runShell", &json!({"command": "sleep 30", "timeout_secs": 1}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("timed out")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_env_keeps_path_drops_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let path_out = run_shell_checked(&ctx, "echo $PATH", 10).await.unwrap();
+        assert_ne!(path_out.trim(), "");
+        unsafe {
+            std::env::set_var("POLYPORT_TASK4_PROBE_TOKEN", "probe-secret-abc123");
+        }
+        let env_out = run_shell_checked(&ctx, "env", 10).await.unwrap();
+        unsafe {
+            std::env::remove_var("POLYPORT_TASK4_PROBE_TOKEN");
+        }
+        assert!(!env_out.contains("probe-secret-abc123"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_output_truncated_to_32kb() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let out = run_shell_checked(&ctx, "yes A | head -n 30000", 30).await.unwrap();
+        assert!(out.contains('A'));
+        assert!(out.len() <= 32 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_cwd_jailed_to_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let out = run_shell_checked(&ctx, "pwd", 10).await.unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        assert_eq!(out.trim(), root.to_string_lossy());
     }
 
     #[test]
