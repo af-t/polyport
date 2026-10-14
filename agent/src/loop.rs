@@ -202,7 +202,11 @@ pub async fn run_agent(
             break;
         }
 
-        if let Ok(steer_msg) = steer.try_recv() {
+        let mut latest_steer = None;
+        while let Ok(steer_msg) = steer.try_recv() {
+            latest_steer = Some(steer_msg);
+        }
+        if let Some(steer_msg) = latest_steer {
             history.push(json!({
                 "role": "user",
                 "content": steer_msg,
@@ -419,7 +423,8 @@ pub async fn run_agent(
             break;
         }
 
-        let _ = events.send(AgentEvent::TurnEnd { terminal: false }).await;
+        let is_last_turn = _turn + 1 >= cfg.max_turns;
+        let _ = events.send(AgentEvent::TurnEnd { terminal: is_last_turn }).await;
     }
 
     history
