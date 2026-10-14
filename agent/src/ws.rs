@@ -85,6 +85,8 @@ async fn handle_start(
     data: StartMessage,
     ws_out_tx: &mpsc::Sender<AxumMessage>,
     saved_history: &Arc<Mutex<Vec<Message>>>,
+    active_run_id: &Arc<std::sync::atomic::AtomicU64>,
+    current_run_id: u64,
 ) -> Option<ActiveRun> {
     let model = match data.model.as_deref() {
         Some(m) if !m.trim().is_empty() => m.trim().to_string(),
@@ -193,6 +195,7 @@ async fn handle_start(
     let run_out_tx = ws_out_tx.clone();
     let mid = client_message_id;
     let saved_history_clone = Arc::clone(saved_history);
+    let active_run_id_clone = Arc::clone(active_run_id);
 
     let task = tokio::spawn(async move {
         let agent_task =
@@ -206,6 +209,10 @@ async fn handle_start(
         let mut total_reasoning = String::new();
 
         while let Some(event) = events_rx.recv().await {
+            if active_run_id_clone.load(std::sync::atomic::Ordering::SeqCst) != current_run_id {
+                return;
+            }
+
             if !started {
                 started = true;
                 send_frame(
@@ -288,6 +295,9 @@ async fn handle_start(
 
         match agent_task.await {
             Ok(final_history) => {
+                if active_run_id_clone.load(std::sync::atomic::Ordering::SeqCst) != current_run_id {
+                    return;
+                }
                 *saved_history_clone.lock().await = final_history.clone();
                 send_frame(
                     &run_out_tx,
@@ -308,6 +318,9 @@ async fn handle_start(
                 .await;
             }
             Err(e) => {
+                if active_run_id_clone.load(std::sync::atomic::Ordering::SeqCst) != current_run_id {
+                    return;
+                }
                 if !e.is_cancelled() {
                     send_frame(
                         &run_out_tx,
@@ -345,6 +358,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
 
     let saved_history = Arc::new(Mutex::new(Vec::<Message>::new()));
     let mut active_run: Option<ActiveRun> = None;
+    let active_run_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     while let Some(msg_res) = ws_receiver.next().await {
         let Ok(msg) = msg_res else { break };
@@ -371,6 +385,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
 
         match msg_type {
             "start" => {
+                let current_run_id = active_run_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 if let Some(active) = active_run.take() {
                     let _ = active.abort_tx.send(true);
                     active.task.abort();
@@ -381,7 +396,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                     continue;
                 };
 
-                active_run = handle_start(&state, start_data, &ws_out_tx, &saved_history).await;
+                active_run = handle_start(
+                    &state,
+                    start_data,
+                    &ws_out_tx,
+                    &saved_history,
+                    &active_run_id,
+                    current_run_id,
+                )
+                .await;
             }
             "steer" => {
                 let Ok(steer_data) = serde_json::from_value::<SteerMessage>(json_val) else {
@@ -393,8 +416,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                 }
             }
             "stop" => {
+                active_run_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Some(active) = active_run.take() {
                     let _ = active.abort_tx.send(true);
+                    active.task.abort();
                 }
                 send_frame(
                     &ws_out_tx,
@@ -407,6 +432,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                 .await;
             }
             "reset" => {
+                active_run_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Some(active) = active_run.take() {
                     let _ = active.abort_tx.send(true);
                     active.task.abort();
@@ -429,6 +455,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
     }
 
     if let Some(active) = active_run.take() {
+        active_run_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _ = active.abort_tx.send(true);
         active.task.abort();
     }

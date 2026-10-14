@@ -929,6 +929,7 @@ fn build_shell(cmd: &str) -> tokio::process::Command {
 fn build_shell(cmd: &str) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("sh");
     command.arg("-c").arg(cmd);
+    command.process_group(0);
     command
 }
 
@@ -975,6 +976,14 @@ pub async fn run_shell_checked(ctx: &ToolCtx, cmd: &str, timeout_secs: u64) -> R
         Ok(Ok((stdout, stderr))) => (stdout, stderr),
         Ok(Err(err)) => return Err(err),
         Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id()
+                && let Ok(pid_i32) = i32::try_from(pid)
+            {
+                unsafe {
+                    libc::kill(-pid_i32, libc::SIGKILL);
+                }
+            }
             let _ = child.start_kill();
             let _ = child.wait().await;
             return Err(ToolError::Failed(format!("runShell: timed out after {timeout_secs}s")));
@@ -2234,6 +2243,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("timed out")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_timeout_kills_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let pid_file = dir.path().join("child.pid");
+        let cmd = format!(
+            "(sh -c 'echo $$ > \"{}\"; exec sleep 30') & sleep 30",
+            pid_file.display()
+        );
+        let res = run_shell_checked(&ctx, &cmd, 1).await;
+        assert!(res.is_err());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_file)
+            && let Ok(pid) = pid_str.trim().parse::<i32>()
+        {
+            let exists = unsafe { libc::kill(pid, 0) == 0 };
+            assert!(
+                !exists,
+                "background child process in process group should have been killed"
+            );
+        }
     }
 
     #[cfg(unix)]
