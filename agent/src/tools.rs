@@ -1,6 +1,7 @@
 // https://github.com/af-t/agent-sdk/tree/v4.0.0/src/tools
 
 use base64::Engine as _;
+use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -407,9 +408,9 @@ const MAX_WRITE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SEARCH_BYTES: u64 = 1024 * 1024;
 const DEFAULT_PAGE_LINES: usize = 1500;
 
-/// Dispatch a tool call by name. File tools, `runShell`, `fetchUrl`, and
-/// `searchWeb` are implemented here; the remaining two return
-/// `Failed("unknown tool: ...")` until later tasks.
+/// Dispatch a tool call by name. All ten manifest tools are implemented:
+/// file tools, `runShell`, `fetchUrl`, `searchWeb`, `manageTodos`, and
+/// `loadSkill`.
 ///
 /// # Errors
 ///
@@ -426,6 +427,8 @@ pub async fn execute_tool(name: &str, input: &serde_json::Value, ctx: &ToolCtx) 
         "runShell" => exec_run_shell(input, ctx).await,
         "fetchUrl" => exec_fetch_url(input, ctx).await,
         "searchWeb" => exec_search_web(input, ctx).await,
+        "manageTodos" => exec_manage_todos(input, ctx).await,
+        "loadSkill" => exec_load_skill(input),
         _ => Err(ToolError::Failed(format!("unknown tool: {name}"))),
     }
 }
@@ -1319,6 +1322,470 @@ async fn exec_search_web(input: &serde_json::Value, ctx: &ToolCtx) -> Result<Str
     Ok(format_ddg_results(&data, max_results))
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct TodoItem {
+    id: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default = "default_todo_priority")]
+    priority: String,
+    #[serde(default = "default_todo_category")]
+    category: String,
+    #[serde(default)]
+    completed: bool,
+    #[serde(rename = "createdAt", default)]
+    created_at: String,
+    #[serde(rename = "updatedAt", default)]
+    updated_at: String,
+    #[serde(rename = "dueDate", default)]
+    due_date: Option<String>,
+}
+
+fn default_todo_priority() -> String {
+    "medium".to_string()
+}
+
+fn default_todo_category() -> String {
+    "general".to_string()
+}
+
+const MAX_TODO_ITEMS: usize = 1000;
+
+fn priority_rank(priority: &str) -> u8 {
+    match priority {
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+fn days_to_civil(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_part = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+    let month = if month_part < 10 {
+        month_part + 3
+    } else {
+        month_part - 9
+    };
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+fn now_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let day_secs = i64::try_from(secs).unwrap_or(0);
+    let (year, month, day) = days_to_civil(day_secs.div_euclid(86_400));
+    let rest = day_secs.rem_euclid(86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    )
+}
+
+fn generate_todo_id(todos: &[TodoItem]) -> String {
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let salt = u32::try_from(todos.len()).unwrap_or(u32::MAX);
+    let mut value = nanos ^ salt.wrapping_mul(0x9E37_79B9);
+    let mut id = String::with_capacity(5);
+    for _ in 0..5 {
+        let index = usize::try_from(value % 36).unwrap_or(0);
+        id.push(char::from(ALPHABET[index]));
+        value /= 36;
+    }
+    let mut candidate = id.clone();
+    let mut bump = 0_u32;
+    while todos.iter().any(|todo| todo.id == candidate) {
+        bump += 1;
+        candidate = format!("{id}-{bump}");
+    }
+    candidate
+}
+
+async fn todos_file_path(input: &serde_json::Value, ctx: &ToolCtx) -> Result<PathBuf, ToolError> {
+    let rel = input
+        .get("todoFile")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("todos.json");
+    if rel.trim().is_empty() {
+        return Err(ToolError::Failed("manageTodos: empty 'todoFile'".to_string()));
+    }
+    tokio::fs::create_dir_all(&ctx.sandbox_root)
+        .await
+        .map_err(|err| ToolError::Failed(format!("manageTodos: sandbox root unavailable: {err}")))?;
+    resolve_in(&ctx.sandbox_root, rel)
+}
+
+async fn read_todos(path: &Path) -> Result<Vec<TodoItem>, ToolError> {
+    let raw = match tokio::fs::read_to_string(path).await {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(ToolError::Failed(format!("manageTodos: cannot read todo file: {err}"))),
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| ToolError::Failed(format!("manageTodos: corrupt todo file: {err}")))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| ToolError::Failed("manageTodos: todo file must contain a JSON array".to_string()))?;
+    for item in items {
+        if let Some(object) = item.as_object() {
+            for legacy in ["created_at", "updated_at", "due_date"] {
+                if object.contains_key(legacy) {
+                    return Err(ToolError::Failed(
+                        "manageTodos: todo file uses removed fields; rename created_at to createdAt, updated_at to updatedAt, and due_date to dueDate".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    serde_json::from_value::<Vec<TodoItem>>(value)
+        .map_err(|err| ToolError::Failed(format!("manageTodos: corrupt todo file: {err}")))
+}
+
+async fn write_todos(path: &Path, todos: &[TodoItem]) -> Result<(), ToolError> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|err| ToolError::Failed(format!("manageTodos: cannot create todo dir: {err}")))?;
+    }
+    let pretty = serde_json::to_string_pretty(todos)
+        .map_err(|err| ToolError::Failed(format!("manageTodos: cannot encode todos: {err}")))?;
+    tokio::fs::write(path, pretty)
+        .await
+        .map_err(|err| ToolError::Failed(format!("manageTodos: cannot write todo file: {err}")))?;
+    Ok(())
+}
+
+fn todo_priority_label(priority: &str) -> &'static str {
+    match priority {
+        "high" => "[high]",
+        "low" => "[low]",
+        _ => "[medium]",
+    }
+}
+
+async fn todo_add(input: &serde_json::Value, path: &Path, todos: &mut Vec<TodoItem>) -> Result<String, ToolError> {
+    let text = input
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolError::Failed("manageTodos: 'text' is required to add a todo".to_string()))?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(ToolError::Failed(
+            "manageTodos: 'text' is required to add a todo".to_string(),
+        ));
+    }
+    if todos.len() >= MAX_TODO_ITEMS {
+        return Err(ToolError::Failed(format!(
+            "manageTodos: maximum todo limit reached ({MAX_TODO_ITEMS})"
+        )));
+    }
+    let priority = input
+        .get("priority")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("medium");
+    let category = input
+        .get("category")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("general");
+    let due_date = input
+        .get("dueDate")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let now = now_iso();
+    let item = TodoItem {
+        id: generate_todo_id(todos),
+        text: trimmed.to_string(),
+        priority: priority.to_string(),
+        category: category.to_string(),
+        completed: false,
+        created_at: now.clone(),
+        updated_at: now,
+        due_date,
+    };
+    let due_info = item
+        .due_date
+        .as_deref()
+        .map_or(String::new(), |due| format!(" (Due: {due})"));
+    let out = format!(
+        "Todo added:\n   Text: {}\n   Priority: {}\n   Category: {}{due_info}\n   ID: {}",
+        item.text,
+        item.priority.to_uppercase(),
+        item.category,
+        item.id
+    );
+    todos.push(item);
+    write_todos(path, todos).await?;
+    Ok(out)
+}
+
+fn todo_list(input: &serde_json::Value, todos: &[TodoItem]) -> String {
+    let filter = input.get("filter").and_then(serde_json::Value::as_str).unwrap_or("all");
+    let sort_by = input
+        .get("sortBy")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("createdAt");
+    let mut view: Vec<&TodoItem> = todos.iter().collect();
+    if filter == "pending" {
+        view.retain(|todo| !todo.completed);
+    } else if filter == "completed" {
+        view.retain(|todo| todo.completed);
+    }
+    match sort_by {
+        "priority" => view.sort_by(|a, b| {
+            priority_rank(&b.priority)
+                .cmp(&priority_rank(&a.priority))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        }),
+        "dueDate" => view.sort_by(|a, b| match (&a.due_date, &b.due_date) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (Some(first), Some(second)) => first.cmp(second),
+        }),
+        _ => view.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
+    }
+    let label = if filter == "all" {
+        String::new()
+    } else {
+        format!(" ({filter})")
+    };
+    if view.is_empty() {
+        return format!("No tasks{label}.");
+    }
+    let mut out = format!("Task List{label} - Total: {}\n", view.len());
+    out.push_str(&"-".repeat(60));
+    out.push('\n');
+    for (index, todo) in view.iter().enumerate() {
+        let status = if todo.completed { "[done]" } else { "[pending]" };
+        let due_info = todo
+            .due_date
+            .as_deref()
+            .map_or(String::new(), |due| format!(" | due: {due}"));
+        let _ = write!(
+            out,
+            "{}. {status} {} {}\n   ID: {} | {} | Created: {}{due_info}\n",
+            index + 1,
+            todo_priority_label(&todo.priority),
+            todo.text,
+            todo.id,
+            todo.category.to_uppercase(),
+            todo.created_at,
+        );
+    }
+    let total = todos.len();
+    let completed = todos.iter().filter(|todo| todo.completed).count();
+    let pending = total - completed;
+    out.push_str(&"-".repeat(60));
+    let _ = write!(out, "\nSummary: {completed}/{total} completed | {pending} pending");
+    out
+}
+
+async fn todo_complete(input: &serde_json::Value, path: &Path, todos: &mut [TodoItem]) -> Result<String, ToolError> {
+    let id = input
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolError::Failed("manageTodos: 'id' is required to complete a todo".to_string()))?;
+    let text = {
+        let todo = todos
+            .iter_mut()
+            .find(|todo| todo.id == id)
+            .ok_or_else(|| ToolError::Failed(format!("manageTodos: todo with ID \"{id}\" not found")))?;
+        if todo.completed {
+            return Ok(format!("Todo \"{}\" is already completed.", todo.text));
+        }
+        todo.completed = true;
+        todo.updated_at = now_iso();
+        todo.text.clone()
+    };
+    write_todos(path, todos).await?;
+    Ok(format!("Todo completed:\n   \"{text}\""))
+}
+
+async fn todo_delete(input: &serde_json::Value, path: &Path, todos: &mut Vec<TodoItem>) -> Result<String, ToolError> {
+    let id = input
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolError::Failed("manageTodos: 'id' is required to delete a todo".to_string()))?;
+    let index = todos
+        .iter()
+        .position(|todo| todo.id == id)
+        .ok_or_else(|| ToolError::Failed(format!("manageTodos: todo with ID \"{id}\" not found")))?;
+    let removed = todos.remove(index);
+    write_todos(path, todos).await?;
+    Ok(format!("Todo deleted:\n   \"{}\"", removed.text))
+}
+
+async fn todo_update(input: &serde_json::Value, path: &Path, todos: &mut [TodoItem]) -> Result<String, ToolError> {
+    let id = input
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolError::Failed("manageTodos: 'id' is required to update a todo".to_string()))?;
+    let snapshot = {
+        let todo = todos
+            .iter_mut()
+            .find(|todo| todo.id == id)
+            .ok_or_else(|| ToolError::Failed(format!("manageTodos: todo with ID \"{id}\" not found")))?;
+        let mut changes: Vec<&str> = Vec::new();
+        if let Some(text) = input.get("text").and_then(serde_json::Value::as_str) {
+            todo.text = text.trim().to_string();
+            changes.push("text");
+        }
+        if let Some(priority) = input.get("priority").and_then(serde_json::Value::as_str) {
+            todo.priority = priority.to_string();
+            changes.push("priority");
+        }
+        if let Some(category) = input.get("category").and_then(serde_json::Value::as_str) {
+            todo.category = category.to_string();
+            changes.push("category");
+        }
+        if input.as_object().is_some_and(|fields| fields.contains_key("dueDate")) {
+            todo.due_date = input
+                .get("dueDate")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            changes.push("due date");
+        }
+        if let Some(completed) = input.get("completed").and_then(serde_json::Value::as_bool) {
+            todo.completed = completed;
+            changes.push("status");
+        }
+        todo.updated_at = now_iso();
+        (todo.clone(), changes.join(", "))
+    };
+    let (updated, changed) = snapshot;
+    write_todos(path, todos).await?;
+    if changed.is_empty() {
+        return Ok(format!("No changes applied to todo \"{}\".", updated.text));
+    }
+    let status = if updated.completed {
+        "[done] Completed"
+    } else {
+        "[pending] Pending"
+    };
+    let due_info = updated
+        .due_date
+        .as_deref()
+        .map_or(String::new(), |due| format!(" | due: {due}"));
+    Ok(format!(
+        "Todo updated:\n   \"{}\"\n   Status: {status}\n   Priority: {} {}\n   Category: {}{due_info}\n   Changed: {changed}",
+        updated.text,
+        todo_priority_label(&updated.priority),
+        updated.priority.to_uppercase(),
+        updated.category.to_uppercase(),
+    ))
+}
+
+async fn todo_clear(path: &Path, todos: &mut Vec<TodoItem>) -> Result<String, ToolError> {
+    if todos.is_empty() {
+        return Ok("Todo list is already empty.".to_string());
+    }
+    let count = todos.len();
+    todos.clear();
+    write_todos(path, todos).await?;
+    Ok(format!("Cleared {count} todos."))
+}
+
+async fn exec_manage_todos(input: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
+    let op = input
+        .get("action")
+        .or_else(|| input.get("op"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolError::Failed("manageTodos: missing 'action'".to_string()))?;
+    let path = todos_file_path(input, ctx).await?;
+    let mut todos = read_todos(&path).await?;
+    match op {
+        "add" => todo_add(input, &path, &mut todos).await,
+        "list" => Ok(todo_list(input, &todos)),
+        "complete" => todo_complete(input, &path, &mut todos).await,
+        "delete" => todo_delete(input, &path, &mut todos).await,
+        "update" => todo_update(input, &path, &mut todos).await,
+        "clear" => todo_clear(&path, &mut todos).await,
+        other => Err(ToolError::Failed(format!("manageTodos: unknown op '{other}'"))),
+    }
+}
+
+fn list_skills() -> String {
+    let names = crate::skills::skill_names();
+    let mut out = format!("# Available Skills ({})\n", names.len());
+    for name in names {
+        let _ = write!(out, "\n- {name}");
+    }
+    out
+}
+
+fn load_one_skill(name: &str) -> Result<String, ToolError> {
+    crate::skills::load_skill(name)
+        .map(|body| format!("# {name}\n\n{body}"))
+        .ok_or_else(|| ToolError::Failed(format!("loadSkill: skill \"{name}\" not found")))
+}
+
+fn search_skills(query: &str) -> String {
+    let lowered = query.to_lowercase();
+    let hits: Vec<&str> = crate::skills::skill_names()
+        .into_iter()
+        .filter(|name| {
+            name.to_lowercase().contains(&lowered)
+                || crate::skills::load_skill(name).is_some_and(|body| body.to_lowercase().contains(&lowered))
+        })
+        .collect();
+    if hits.is_empty() {
+        return format!("No skills found matching \"{query}\".\n\n{}", list_skills());
+    }
+    let mut out = format!("# Skills matching \"{query}\" ({})\n", hits.len());
+    for name in hits {
+        let _ = write!(out, "\n- {name}");
+    }
+    out
+}
+
+fn exec_load_skill(input: &serde_json::Value) -> Result<String, ToolError> {
+    let action = input
+        .get("action")
+        .or_else(|| input.get("op"))
+        .and_then(serde_json::Value::as_str);
+    let argument = input
+        .get("argument")
+        .or_else(|| input.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim);
+    match action {
+        Some("list") => Ok(list_skills()),
+        Some("load") => {
+            let name = argument
+                .filter(|arg| !arg.is_empty())
+                .ok_or_else(|| ToolError::Failed("loadSkill: 'argument' is required to load a skill".to_string()))?;
+            load_one_skill(name)
+        }
+        Some("search") => {
+            let query = argument
+                .filter(|arg| !arg.is_empty())
+                .ok_or_else(|| ToolError::Failed("loadSkill: 'argument' is required to search skills".to_string()))?;
+            Ok(search_skills(query))
+        }
+        Some(other) => Err(ToolError::Failed(format!("loadSkill: unknown action '{other}'"))),
+        None => match argument {
+            None | Some("") => Ok(list_skills()),
+            Some(name) => load_one_skill(name),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1543,15 +2010,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_todos_add_and_list() {
+        let ctx = ToolCtx::test_in(&tempfile::tempdir().unwrap());
+        execute_tool("manageTodos", &json!({"op":"add","text":"write code"}), &ctx)
+            .await
+            .unwrap();
+        let out = execute_tool("manageTodos", &json!({"op":"list"}), &ctx).await.unwrap();
+        assert!(out.contains("write code"));
+    }
+
+    #[tokio::test]
     async fn test_unknown_tool_failed() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ToolCtx::test_in(&dir);
         let err = execute_tool("teleport", &json!({}), &ctx).await.unwrap_err();
         assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("unknown tool")));
-        let err = execute_tool("manageTodos", &json!({"action": "list"}), &ctx)
+    }
+
+    #[tokio::test]
+    async fn test_todos_update_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let added = execute_tool("manageTodos", &json!({"action": "add", "text": "first task"}), &ctx)
+            .await
+            .unwrap();
+        let id = added.rsplit("ID:").next().unwrap().trim().to_string();
+        let updated = execute_tool(
+            "manageTodos",
+            &json!({"action": "update", "id": id, "text": "second task"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(updated.contains("second task"));
+        let out = execute_tool("manageTodos", &json!({"action": "list"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("second task"));
+        assert!(!out.contains("first task"));
+    }
+
+    #[tokio::test]
+    async fn test_todos_complete_delete_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let added = execute_tool("manageTodos", &json!({"op": "add", "text": "finish me"}), &ctx)
+            .await
+            .unwrap();
+        let id = added.rsplit("ID:").next().unwrap().trim().to_string();
+        let done = execute_tool("manageTodos", &json!({"op": "complete", "id": id}), &ctx)
+            .await
+            .unwrap();
+        assert!(done.contains("finish me"));
+        let pending = execute_tool("manageTodos", &json!({"op": "list", "filter": "pending"}), &ctx)
+            .await
+            .unwrap();
+        assert!(pending.contains("No tasks"));
+        let cleared = execute_tool("manageTodos", &json!({"op": "clear"}), &ctx)
+            .await
+            .unwrap();
+        assert!(cleared.contains("Cleared 1 todos"));
+        let deleted_ctx_out = execute_tool("manageTodos", &json!({"op": "list"}), &ctx).await.unwrap();
+        assert!(deleted_ctx_out.contains("No tasks"));
+        let missing = execute_tool("manageTodos", &json!({"op": "delete", "id": id}), &ctx)
             .await
             .unwrap_err();
-        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("unknown tool")));
+        assert!(matches!(missing, ToolError::Failed(ref msg) if msg.contains("not found")));
+    }
+
+    #[tokio::test]
+    async fn test_todos_unknown_op_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let err = execute_tool("manageTodos", &json!({"op": "frobnicate"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("unknown op")));
+        let err = execute_tool("manageTodos", &json!({"action": "frobnicate"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("unknown op")));
+        let err = execute_tool("manageTodos", &json!({}), &ctx).await.unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("missing 'action'")));
+    }
+
+    #[tokio::test]
+    async fn test_todos_corrupt_state_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        execute_tool(
+            "writeFile",
+            &json!({"path": "todos.json", "content": "not json {{{"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let err = execute_tool("manageTodos", &json!({"op": "list"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("corrupt")));
+        execute_tool(
+            "writeFile",
+            &json!({"path": "todos.json", "content": "{\"a\":1}", "overwrite": true}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let err = execute_tool("manageTodos", &json!({"op": "list"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_todos_missing_file_lists_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let out = execute_tool("manageTodos", &json!({"op": "list"}), &ctx).await.unwrap();
+        assert!(out.contains("No tasks"));
+    }
+
+    #[tokio::test]
+    async fn test_todos_file_stays_in_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let err = execute_tool(
+            "manageTodos",
+            &json!({"action": "list", "todoFile": "/tmp/evil-todos.json"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)));
+        execute_tool(
+            "manageTodos",
+            &json!({"action": "add", "text": "custom path", "todoFile": "custom/todos.json"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let out = execute_tool(
+            "manageTodos",
+            &json!({"action": "list", "todoFile": "custom/todos.json"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("custom path"));
+        assert!(dir.path().join("custom/todos.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_load_skill_list_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let out = execute_tool("loadSkill", &json!({}), &ctx).await.unwrap();
+        assert!(out.contains("commit-message"));
+        assert!(out.contains("code-review-checklist"));
+        let out = execute_tool("loadSkill", &json!({"action": "list"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("commit-message"));
+        let out = execute_tool("loadSkill", &json!({"name": "commit-message"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("commit message"));
+        let out = execute_tool(
+            "loadSkill",
+            &json!({"action": "load", "argument": "code-review-checklist"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Checklist"));
+        let out = execute_tool("loadSkill", &json!({"action": "search", "argument": "commit"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("commit-message"));
+    }
+
+    #[tokio::test]
+    async fn test_load_skill_unknown_name_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let err = execute_tool("loadSkill", &json!({"name": "no-such-skill"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("not found")));
+        let err = execute_tool(
+            "loadSkill",
+            &json!({"action": "load", "argument": "no-such-skill"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("not found")));
     }
 
     #[tokio::test]
