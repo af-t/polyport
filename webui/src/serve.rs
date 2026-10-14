@@ -7,8 +7,13 @@ use crate::file_api::{FileState, file_handler};
 use crate::static_files::{UiState, static_fallback};
 
 pub fn build_webui_app(core_state: AppState, ui_state: UiState, file_state: FileState, proxy_only: bool) -> Router {
-    let mut app = create_app(core_state).route("/api/file", get(file_handler).with_state(file_state));
+    let mut app = create_app(core_state).route("/api/file", get(file_handler).with_state(file_state.clone()));
     if !proxy_only {
+        let port = polyport_core::config::get_port();
+        app = app.merge(polyport_agent::ws::agent_router_with_root(
+            port,
+            file_state.sandbox_root,
+        ));
         app = app.fallback_service(static_fallback.with_state(ui_state));
     }
     app
@@ -96,5 +101,37 @@ mod tests {
         let req = Request::builder().uri("/health").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_chat_ws_excluded_when_proxy_only() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let core_state = AppState::default();
+        let ui_state = UiState {
+            asset_dir: Some(temp_dir.path().to_path_buf()),
+        };
+        let file_state = FileState {
+            sandbox_root: temp_dir.path().to_path_buf(),
+        };
+        let app = build_webui_app(core_state, ui_state, file_state, true);
+        let req = Request::builder().uri("/api/chat").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_chat_ws_mounted_when_not_proxy_only() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let core_state = AppState::default();
+        let ui_state = UiState {
+            asset_dir: Some(temp_dir.path().to_path_buf()),
+        };
+        let file_state = FileState {
+            sandbox_root: temp_dir.path().to_path_buf(),
+        };
+        let app = build_webui_app(core_state, ui_state, file_state, false);
+        let req = Request::builder().uri("/api/chat").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_ne!(res.status(), StatusCode::NOT_FOUND);
     }
 }

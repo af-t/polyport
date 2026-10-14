@@ -5,7 +5,9 @@ edition = "2024"
 rust-version = "1.89.0"
 
 [dependencies]
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
+futures-util = "0.3"
 ignore = "0.4"
 regex = "1.13.1"
 reqwest = { version = "0.13", features = ["json", "rustls", "stream"] }
@@ -16,8 +18,8 @@ thiserror = "2.0"
 tokio = { version = "1.53", features = ["full"] }
 
 [dev-dependencies]
-axum = { version = "0.8" }
 tempfile = "3"
+tokio-tungstenite = "0.30"
 
 [lints]
 workspace = true

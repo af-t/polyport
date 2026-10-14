@@ -1300,6 +1300,7 @@ dependencies = [
  "axum",
  "clap",
  "mime_guess",
+ "polyport-agent",
  "polyport-core",
  "rust-embed",
  "serde_json",
@@ -1314,6 +1315,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "futures-util",
  "ignore",
  "regex",
  "reqwest",
@@ -1323,6 +1325,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite 0.30.0",
 ]
 
 [[package]]

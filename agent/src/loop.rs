@@ -197,7 +197,7 @@ pub async fn run_agent(
         })
         .collect();
 
-    for _turn in 0..cfg.max_turns {
+    for turn in 0..cfg.max_turns {
         if *abort.borrow() {
             break;
         }
@@ -423,7 +423,7 @@ pub async fn run_agent(
             break;
         }
 
-        let is_last_turn = _turn + 1 >= cfg.max_turns;
+        let is_last_turn = turn + 1 >= cfg.max_turns;
         let _ = events.send(AgentEvent::TurnEnd { terminal: is_last_turn }).await;
     }
 
