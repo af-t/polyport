@@ -1,7 +1,9 @@
 // https://github.com/af-t/agent-sdk/tree/v4.0.0/src/tools
 
 use base64::Engine as _;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ToolError {
@@ -29,6 +31,10 @@ pub struct ToolCtx {
     pub shell_timeout_secs: u64,
     pub fetch_timeout_secs: u64,
     pub fetch_max_bytes: usize,
+    /// Test hook: permit loopback destinations (`127/8`, `::1`) so unit tests can
+    /// reach an in-process stub server. Defaults to false; every other blocked
+    /// range stays denied when this is set.
+    pub fetch_allow_loopback: bool,
 }
 
 impl Default for ToolCtx {
@@ -39,6 +45,7 @@ impl Default for ToolCtx {
             shell_timeout_secs: 120,
             fetch_timeout_secs: 30,
             fetch_max_bytes: 2 * 1024 * 1024,
+            fetch_allow_loopback: false,
         }
     }
 }
@@ -400,13 +407,15 @@ const MAX_WRITE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SEARCH_BYTES: u64 = 1024 * 1024;
 const DEFAULT_PAGE_LINES: usize = 1500;
 
-/// Dispatch a tool call by name. File tools and `runShell` are implemented
-/// here; the remaining four return `Failed("unknown tool: ...")` until later tasks.
+/// Dispatch a tool call by name. File tools, `runShell`, `fetchUrl`, and
+/// `searchWeb` are implemented here; the remaining two return
+/// `Failed("unknown tool: ...")` until later tasks.
 ///
 /// # Errors
 ///
 /// Returns `ToolError::Failed` for unknown tool names or malformed inputs.
 /// File tools can also return `Denied`, `NotFound`, or `TooLarge`.
+/// `fetchUrl` returns `Denied` for SSRF-blocked targets.
 pub async fn execute_tool(name: &str, input: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
     match name {
         "readFile" => exec_read_file(input, ctx).await,
@@ -415,6 +424,8 @@ pub async fn execute_tool(name: &str, input: &serde_json::Value, ctx: &ToolCtx) 
         "findFiles" => exec_find_files(input, ctx),
         "listFiles" => exec_list_files(input, ctx),
         "runShell" => exec_run_shell(input, ctx).await,
+        "fetchUrl" => exec_fetch_url(input, ctx).await,
+        "searchWeb" => exec_search_web(input, ctx).await,
         _ => Err(ToolError::Failed(format!("unknown tool: {name}"))),
     }
 }
@@ -991,6 +1002,323 @@ async fn exec_run_shell(input: &serde_json::Value, ctx: &ToolCtx) -> Result<Stri
     run_shell_checked(ctx, cmd, timeout_secs).await
 }
 
+const MAX_FETCH_REDIRECTS: usize = 3;
+const DEFAULT_SEARCH_RESULTS: usize = 5;
+const MAX_SEARCH_RESULTS: usize = 20;
+
+fn is_blocked_ipv4(octets: [u8; 4], allow_loopback: bool) -> bool {
+    let a = octets[0];
+    let b = octets[1];
+    let c = octets[2];
+    if a == 127 {
+        return !allow_loopback;
+    }
+    if a == 0 || a == 10 {
+        return true;
+    }
+    if a == 172 && (16..=31).contains(&b) {
+        return true;
+    }
+    if a == 192 && b == 168 {
+        return true;
+    }
+    if a == 169 && b == 254 {
+        return true;
+    }
+    if a == 100 && (64..=127).contains(&b) {
+        return true;
+    }
+    if a == 192 && b == 0 && (c == 0 || c == 2) {
+        return true;
+    }
+    if a == 198 && (b == 18 || b == 19) {
+        return true;
+    }
+    if a == 198 && b == 51 && c == 100 {
+        return true;
+    }
+    if a == 203 && b == 0 && c == 113 {
+        return true;
+    }
+    if a >= 224 {
+        return true;
+    }
+    false
+}
+
+fn is_blocked_ipv6(segments: [u16; 8], allow_loopback: bool) -> bool {
+    if segments == [0, 0, 0, 0, 0, 0, 0, 0] {
+        return true;
+    }
+    if segments == [0, 0, 0, 0, 0, 0, 0, 1] {
+        return !allow_loopback;
+    }
+    let top = segments[0];
+    if top & 0xffc0 == 0xfe80 {
+        return true;
+    }
+    if top & 0xfe00 == 0xfc00 {
+        return true;
+    }
+    if top & 0xff00 == 0xff00 {
+        return true;
+    }
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return true;
+    }
+    false
+}
+
+fn is_blocked_ip(ip: &IpAddr, allow_loopback: bool) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_ipv4(v4.octets(), allow_loopback),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_blocked_ipv4(mapped.octets(), allow_loopback);
+            }
+            is_blocked_ipv6(v6.segments(), allow_loopback)
+        }
+    }
+}
+
+async fn check_url_allowed(url: &reqwest::Url, ctx: &ToolCtx) -> Result<(), ToolError> {
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(ToolError::Denied(format!(
+            "fetchUrl: scheme '{}' not allowed",
+            url.scheme()
+        )));
+    }
+    let host = url.host_str().unwrap_or_default();
+    if host.is_empty() {
+        return Err(ToolError::Denied("fetchUrl: URL has no host".to_string()));
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return Err(ToolError::Denied("fetchUrl: localhost is not allowed".to_string()));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ip(&ip, ctx.fetch_allow_loopback) {
+            return Err(ToolError::Denied(format!("fetchUrl: blocked IP {ip}")));
+        }
+        return Ok(());
+    }
+    if host.contains(':') {
+        return Err(ToolError::Denied(format!("fetchUrl: blocked IP literal {host}")));
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|err| ToolError::Denied(format!("fetchUrl: cannot resolve {host}: {err}")))?;
+    let mut resolved = false;
+    for addr in addrs {
+        resolved = true;
+        if is_blocked_ip(&addr.ip(), ctx.fetch_allow_loopback) {
+            return Err(ToolError::Denied(format!(
+                "fetchUrl: {host} resolves to blocked IP {}",
+                addr.ip()
+            )));
+        }
+    }
+    if !resolved {
+        return Err(ToolError::Denied(format!("fetchUrl: {host} resolved to no addresses")));
+    }
+    Ok(())
+}
+
+fn is_redirect(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
+async fn read_body_capped(resp: reqwest::Response, cap: usize) -> Result<(Vec<u8>, bool), ToolError> {
+    let mut resp = resp;
+    let mut buf = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = resp.chunk().await.map_err(|err| ToolError::Failed(err.to_string()))? {
+        let room = cap.saturating_sub(buf.len());
+        if room == 0 {
+            truncated = true;
+            break;
+        }
+        if chunk.len() <= room {
+            buf.extend_from_slice(&chunk);
+        } else {
+            buf.extend_from_slice(&chunk[..room]);
+            truncated = true;
+        }
+    }
+    Ok((buf, truncated))
+}
+
+fn capped_text(buf: &[u8], truncated: bool) -> String {
+    let mut text = String::from_utf8_lossy(buf).into_owned();
+    if truncated && text.ends_with('\u{FFFD}') {
+        text.pop();
+    }
+    text
+}
+
+async fn fetch_bytes_capped(start: &str, ctx: &ToolCtx) -> Result<(reqwest::StatusCode, Vec<u8>, bool), ToolError> {
+    let mut current =
+        reqwest::Url::parse(start).map_err(|err| ToolError::Failed(format!("fetchUrl: invalid URL: {err}")))?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|err| ToolError::Failed(err.to_string()))?;
+    let mut redirects = 0_usize;
+    loop {
+        check_url_allowed(&current, ctx).await?;
+        let resp = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        if is_redirect(resp.status()) {
+            redirects += 1;
+            if redirects > MAX_FETCH_REDIRECTS {
+                return Err(ToolError::Failed(format!(
+                    "fetchUrl: too many redirects (max {MAX_FETCH_REDIRECTS})"
+                )));
+            }
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            if location.is_empty() {
+                return Err(ToolError::Failed("fetchUrl: redirect without location".to_string()));
+            }
+            current = current
+                .join(&location)
+                .map_err(|err| ToolError::Failed(format!("fetchUrl: bad redirect target: {err}")))?;
+            let _ = current.set_username("");
+            let _ = current.set_password(None);
+            continue;
+        }
+        let status = resp.status();
+        let (body, truncated) = read_body_capped(resp, ctx.fetch_max_bytes).await?;
+        return Ok((status, body, truncated));
+    }
+}
+
+async fn exec_fetch_url(input: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
+    let raw = input
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolError::Failed("fetchUrl: missing 'url'".to_string()))?;
+    if raw.trim().is_empty() {
+        return Err(ToolError::Failed("fetchUrl: empty 'url'".to_string()));
+    }
+    let timeout = Duration::from_secs(ctx.fetch_timeout_secs);
+    let (status, body, truncated) = match tokio::time::timeout(timeout, fetch_bytes_capped(raw, ctx)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(ToolError::Failed(format!(
+                "fetchUrl: timed out after {}s",
+                ctx.fetch_timeout_secs
+            )));
+        }
+    };
+    if !status.is_success() {
+        return Err(ToolError::Failed(format!(
+            "fetchUrl: unexpected status {}",
+            status.as_u16()
+        )));
+    }
+    Ok(capped_text(&body, truncated))
+}
+
+fn collect_ddg_topics<'a>(node: &'a serde_json::Value, out: &mut Vec<(&'a str, &'a str)>) {
+    if let Some(nested) = node.get("Topics").and_then(serde_json::Value::as_array) {
+        for child in nested {
+            collect_ddg_topics(child, out);
+        }
+        return;
+    }
+    let text = node.get("Text").and_then(serde_json::Value::as_str).unwrap_or_default();
+    let url = node
+        .get("FirstURL")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    out.push((text, url));
+}
+
+fn format_ddg_results(data: &serde_json::Value, max_results: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let abstract_text = data
+        .get("AbstractText")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if !abstract_text.is_empty() {
+        lines.push(abstract_text.to_string());
+    }
+    if let Some(topics) = data.get("RelatedTopics").and_then(serde_json::Value::as_array) {
+        let mut flat: Vec<(&str, &str)> = Vec::new();
+        for topic in topics {
+            collect_ddg_topics(topic, &mut flat);
+        }
+        for (text, url) in flat {
+            if lines.len() >= max_results {
+                break;
+            }
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let url = url.trim();
+            if url.is_empty() {
+                lines.push(text.to_string());
+            } else {
+                lines.push(format!("{text} ({url})"));
+            }
+        }
+    }
+    if lines.is_empty() {
+        return "no results".to_string();
+    }
+    lines.join("\n")
+}
+
+async fn exec_search_web(input: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
+    let query = input
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolError::Failed("searchWeb: missing 'query'".to_string()))?;
+    if query.trim().is_empty() {
+        return Err(ToolError::Failed("searchWeb: empty 'query'".to_string()));
+    }
+    let max_results = input
+        .get("maxResults")
+        .and_then(num_value)
+        .map_or(DEFAULT_SEARCH_RESULTS, to_usize)
+        .min(MAX_SEARCH_RESULTS);
+    let mut endpoint =
+        reqwest::Url::parse("https://api.duckduckgo.com/").map_err(|err| ToolError::Failed(err.to_string()))?;
+    endpoint
+        .query_pairs_mut()
+        .append_pair("q", query)
+        .append_pair("format", "json");
+    let timeout = Duration::from_secs(ctx.fetch_timeout_secs);
+    let (status, body, _) = match tokio::time::timeout(timeout, fetch_bytes_capped(endpoint.as_str(), ctx)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(ToolError::Failed(format!(
+                "searchWeb: timed out after {}s",
+                ctx.fetch_timeout_secs
+            )));
+        }
+    };
+    if !status.is_success() {
+        return Err(ToolError::Failed(format!(
+            "searchWeb: DuckDuckGo failed ({})",
+            status.as_u16()
+        )));
+    }
+    let data: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|err| ToolError::Failed(format!("searchWeb: bad JSON: {err}")))?;
+    Ok(format_ddg_results(&data, max_results))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1220,7 +1548,7 @@ mod tests {
         let ctx = ToolCtx::test_in(&dir);
         let err = execute_tool("teleport", &json!({}), &ctx).await.unwrap_err();
         assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("unknown tool")));
-        let err = execute_tool("fetchUrl", &json!({"url": "https://example.com"}), &ctx)
+        let err = execute_tool("manageTodos", &json!({"action": "list"}), &ctx)
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("unknown tool")));
@@ -1318,6 +1646,7 @@ mod tests {
         assert_eq!(default_ctx.shell_timeout_secs, 120);
         assert_eq!(default_ctx.fetch_timeout_secs, 30);
         assert_eq!(default_ctx.fetch_max_bytes, 2 * 1024 * 1024);
+        assert!(!default_ctx.fetch_allow_loopback);
 
         let dir = tempfile::tempdir().unwrap();
         let test_ctx = ToolCtx::test_in(&dir);
@@ -1347,5 +1676,205 @@ mod tests {
 
         let resolved_cur = resolve_in(root, ".").unwrap();
         assert_eq!(resolved_cur, root.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_blocked_private_ip() {
+        let ctx = ToolCtx::test_in(&tempfile::tempdir().unwrap());
+        let err = execute_tool("fetchUrl", &json!({"url":"http://169.254.169.254/"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_ssrf_literal_ranges_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let blocked = [
+            "http://127.0.0.1/",
+            "http://10.0.0.5/",
+            "http://172.16.0.9/",
+            "http://172.31.255.1/",
+            "http://192.168.0.1/",
+            "http://100.64.0.1/",
+            "http://192.0.2.1/",
+            "http://198.51.100.2/",
+            "http://203.0.113.3/",
+            "http://198.18.0.1/",
+            "http://224.0.0.1/",
+            "http://255.255.255.255/",
+            "http://0.0.0.0/",
+            "http://[::1]/",
+            "http://[::]/",
+            "http://[fe80::1]/",
+            "http://[fc00::1]/",
+            "http://[ff02::1]/",
+            "http://[2001:db8::1]/",
+            "http://[::ffff:10.0.0.1]/",
+            "http://localhost/",
+            "http://LOCALHOST:8080/x",
+            "ftp://127.0.0.1/x",
+        ];
+        for url in blocked {
+            let err = execute_tool("fetchUrl", &json!({"url": url}), &ctx).await.unwrap_err();
+            assert!(matches!(err, ToolError::Denied(_)), "expected Denied for {url}");
+        }
+    }
+
+    async fn stub_base() -> String {
+        use axum::{Router, response::Redirect, routing::get};
+        let app = Router::new()
+            .route("/ok", get(|| async { "hello stub" }))
+            .route("/chain1", get(|| async { Redirect::to("/chain2") }))
+            .route("/chain2", get(|| async { Redirect::to("/ok") }))
+            .route("/k1", get(|| async { Redirect::to("/k2") }))
+            .route("/k2", get(|| async { Redirect::to("/k3") }))
+            .route("/k3", get(|| async { Redirect::to("/ok") }))
+            .route("/loop", get(|| async { Redirect::to("/loop") }))
+            .route("/evil", get(|| async { Redirect::to("http://10.255.255.1/") }))
+            .route("/big", get(|| async { "A".repeat(200_000) }))
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    "late"
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        base
+    }
+
+    fn stub_ctx(dir: &tempfile::TempDir) -> ToolCtx {
+        let mut ctx = ToolCtx::test_in(dir);
+        ctx.fetch_allow_loopback = true;
+        ctx
+    }
+
+    #[tokio::test]
+    async fn test_fetch_stub_ok_and_redirect_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stub_ctx(&dir);
+        let base = stub_base().await;
+        let out = execute_tool("fetchUrl", &json!({"url": format!("{base}/ok")}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("hello stub"));
+        let out = execute_tool("fetchUrl", &json!({"url": format!("{base}/chain1")}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("hello stub"));
+        let out = execute_tool("fetchUrl", &json!({"url": format!("{base}/k1")}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("hello stub"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_redirect_loop_exceeds_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stub_ctx(&dir);
+        let base = stub_base().await;
+        let err = execute_tool("fetchUrl", &json!({"url": format!("{base}/loop")}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("redirect")));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_redirect_to_private_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stub_ctx(&dir);
+        let base = stub_base().await;
+        let err = execute_tool("fetchUrl", &json!({"url": format!("{base}/evil")}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_byte_cap_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = stub_ctx(&dir);
+        ctx.fetch_max_bytes = 64;
+        let base = stub_base().await;
+        let out = execute_tool("fetchUrl", &json!({"url": format!("{base}/big")}), &ctx)
+            .await
+            .unwrap();
+        assert_ne!(out, "");
+        assert!(out.len() <= 64);
+        assert!(out.chars().all(|ch| ch == 'A'));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_timeout_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = stub_ctx(&dir);
+        ctx.fetch_timeout_secs = 1;
+        let base = stub_base().await;
+        let err = execute_tool("fetchUrl", &json!({"url": format!("{base}/slow")}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("timed out")));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_non_2xx_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stub_ctx(&dir);
+        let base = stub_base().await;
+        let err = execute_tool("fetchUrl", &json!({"url": format!("{base}/nope")}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("404")));
+    }
+
+    #[tokio::test]
+    async fn test_search_empty_query_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let err = execute_tool("searchWeb", &json!({"query": ""}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(_)));
+        let err = execute_tool("searchWeb", &json!({"query": "   "}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(_)));
+        let err = execute_tool("searchWeb", &json!({}), &ctx).await.unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref msg) if msg.contains("missing 'query'")));
+    }
+
+    #[test]
+    fn test_search_ddg_fixture_parse() {
+        let raw = include_str!("../tests/fixtures/ddg.json");
+        let data: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let out = format_ddg_results(&data, 5);
+        assert_eq!(
+            out,
+            "Rust is a systems programming language focused on safety and performance.\n\
+             Cargo - Rust package manager and build system (https://en.wikipedia.org/wiki/Cargo_(software))\n\
+             The Rust Book - official guide (https://doc.rust-lang.org/book/)\n\
+             Rust Playground - compile and run code in a browser (https://play.rust-lang.org/)\n\
+             Rust official site (https://www.rust-lang.org/)"
+        );
+        let capped = format_ddg_results(&data, 2);
+        assert_eq!(
+            capped,
+            "Rust is a systems programming language focused on safety and performance.\n\
+             Cargo - Rust package manager and build system (https://en.wikipedia.org/wiki/Cargo_(software))"
+        );
+    }
+
+    #[test]
+    fn test_search_no_results() {
+        let empty = serde_json::json!({"AbstractText": "", "RelatedTopics": []});
+        assert_eq!(format_ddg_results(&empty, 5), "no results");
+        let missing = serde_json::json!({});
+        assert_eq!(format_ddg_results(&missing, 5), "no results");
     }
 }

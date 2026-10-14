@@ -1,0 +1,47 @@
+{
+  "Abstract": "",
+  "AbstractText": "Rust is a systems programming language focused on safety and performance.",
+  "AbstractSource": "Wikipedia",
+  "AbstractURL": "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+  "Image": "",
+  "Heading": "Rust (programming language)",
+  "Answer": "",
+  "Redirect": "",
+  "AnswerType": "",
+  "Definition": "",
+  "DefinitionSource": "",
+  "DefinitionURL": "",
+  "RelatedTopics": [
+    {
+      "FirstURL": "https://en.wikipedia.org/wiki/Cargo_(software)",
+      "Icon": {"URL": "", "Height": "", "Width": ""},
+      "Result": "<a href=\"https://en.wikipedia.org/wiki/Cargo_(software)\">Cargo</a> - Rust package manager and build system",
+      "Text": "Cargo - Rust package manager and build system"
+    },
+    {
+      "Name": "See also",
+      "Topics": [
+        {
+          "FirstURL": "https://doc.rust-lang.org/book/",
+          "Icon": {"URL": "", "Height": "", "Width": ""},
+          "Result": "<a href=\"https://doc.rust-lang.org/book/\">The Rust Book</a> - official guide",
+          "Text": "The Rust Book - official guide"
+        },
+        {
+          "FirstURL": "https://play.rust-lang.org/",
+          "Icon": {"URL": "", "Height": "", "Width": ""},
+          "Result": "<a href=\"https://play.rust-lang.org/\">Rust Playground</a> - compile and run code in a browser",
+          "Text": "Rust Playground - compile and run code in a browser"
+        }
+      ]
+    },
+    {
+      "FirstURL": "https://www.rust-lang.org/",
+      "Icon": {"URL": "", "Height": "", "Width": ""},
+      "Result": "<a href=\"https://www.rust-lang.org/\">Rust</a> official site",
+      "Text": "Rust official site"
+    }
+  ],
+  "Results": [],
+  "meta": {"maintainer": {"github": "duckduckgo"}}
+}
