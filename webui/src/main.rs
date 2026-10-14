@@ -15,6 +15,7 @@ fn version() -> &'static str {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    polyport_core::logging::init_logging(cli.log_level.as_deref());
     match cli.command {
         None | Some(Commands::Start(_)) => {
             let args = match cli.command {
@@ -24,6 +25,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     proxy_only: false,
                     sandbox: None,
                     cache_ttl: None,
+                    log_level: cli.log_level,
                 },
             };
             let port = prepare_start(&args).await?;

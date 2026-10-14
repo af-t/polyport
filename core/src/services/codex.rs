@@ -328,6 +328,11 @@ async fn execute_codex_attempt(
     pool: &Arc<RwLock<AccountPool>>,
     account_id: &str,
 ) -> Result<CodexStreamResult, AttemptError> {
+    tracing::info!(
+        "[Proxy] Routing Codex ({}, account: {account_id})",
+        body.get("model").and_then(|v| v.as_str()).unwrap_or("unknown")
+    );
+
     let res = client
         .post(CODEX_RESPONSES_URL)
         .headers(headers)

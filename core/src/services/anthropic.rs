@@ -705,6 +705,11 @@ async fn execute_claude_attempt(
     pool: &Arc<RwLock<AccountPool>>,
     account_id: &str,
 ) -> Result<ClaudeStreamResult, AttemptError> {
+    tracing::info!(
+        "[Proxy] Routing Claude ({}, account: {account_id})",
+        body.get("model").and_then(|v| v.as_str()).unwrap_or("unknown")
+    );
+
     let res = client
         .post(ANTHROPIC_MESSAGES_URL)
         .headers(headers)

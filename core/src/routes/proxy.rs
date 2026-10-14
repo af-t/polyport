@@ -384,6 +384,8 @@ pub async fn v1_messages_handler(
             .into_response();
     };
 
+    tracing::debug!("--> POST /v1/messages (model: {model})");
+
     let candidates = match resolve_route_candidates(&model, MappingEndpoint::Messages, req.effort.as_deref()) {
         Ok(c) => c,
         Err(err) => {
@@ -834,6 +836,8 @@ pub async fn v1_chat_completions_handler(
         )
             .into_response();
     };
+
+    tracing::debug!("--> POST /v1/chat/completions (model: {model})");
 
     let candidates = match resolve_route_candidates(&model, MappingEndpoint::OpenAi, req.effort.as_deref()) {
         Ok(c) => c,

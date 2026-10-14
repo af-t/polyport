@@ -198,6 +198,14 @@ async fn execute_gemini_attempt(
         .await
         .map_err(|e| AttemptError::Other(anyhow::anyhow!("Auth failed: {e}")))?;
 
+    tracing::info!(
+        "[Proxy] Routing to Gemini pool (model: \"{}\", account: {account_id})",
+        upstream_payload
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+    );
+
     let res = client
         .post("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse")
         .header("Authorization", format!("Bearer {token}"))

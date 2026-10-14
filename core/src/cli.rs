@@ -22,6 +22,9 @@ use crate::services::credentials::{
 #[derive(Debug, Parser)]
 #[command(name = "polyport", version, about = "Polyport AI proxy server")]
 pub struct Cli {
+    #[arg(long = "log-level", global = true)]
+    pub log_level: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -49,16 +52,24 @@ pub struct StartArgs {
     pub sandbox: Option<String>,
     #[arg(long = "cache-ttl")]
     pub cache_ttl: Option<String>,
+    #[arg(long = "log-level")]
+    pub log_level: Option<String>,
 }
 
 #[must_use]
 pub fn parse_cli_args(argv: &[String]) -> Cli {
     if argv.is_empty() {
-        return Cli { command: None };
+        return Cli {
+            log_level: None,
+            command: None,
+        };
     }
     match Cli::try_parse_from(std::iter::once("polyport").chain(argv.iter().map(String::as_str))) {
         Ok(cli) => cli,
-        Err(_) => Cli { command: None },
+        Err(_) => Cli {
+            log_level: None,
+            command: None,
+        },
     }
 }
 
@@ -293,6 +304,7 @@ async fn run_login(provider: &str) -> anyhow::Result<()> {
 /// Returns error for invalid port, invalid cache TTL, or sandbox setup failure.
 #[allow(clippy::unused_async)]
 pub async fn prepare_start(args: &StartArgs) -> anyhow::Result<u16> {
+    crate::logging::init_logging(args.log_level.as_deref());
     if let Some(port) = args.port {
         if port == 0 {
             anyhow::bail!("Invalid port: {port}");
@@ -357,6 +369,7 @@ async fn run_start(args: &StartArgs) -> anyhow::Result<()> {
 /// # Errors
 /// Returns error if server, login exchange, or logout operation fails.
 pub async fn run_cli(cli: Cli) -> anyhow::Result<()> {
+    crate::logging::init_logging(cli.log_level.as_deref());
     match cli.command {
         None => {
             run_start(&StartArgs {
@@ -364,6 +377,7 @@ pub async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 proxy_only: false,
                 sandbox: None,
                 cache_ttl: None,
+                log_level: cli.log_level,
             })
             .await
         }
@@ -417,6 +431,14 @@ mod tests {
     fn test_empty_argv_defaults_to_start() {
         let cli = parse_cli_args(&[]);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn test_log_level_cli_parsing() {
+        let argv = vec!["--log-level".to_string(), "debug".to_string(), "status".to_string()];
+        let cli = parse_cli_args(&argv);
+        assert_eq!(cli.log_level.as_deref(), Some("debug"));
+        assert_eq!(cli.command, Some(Commands::Status));
     }
 
     #[test]
@@ -496,6 +518,7 @@ mod tests {
             proxy_only: true,
             sandbox: Some("/tmp/polyport-plan-w1".into()),
             cache_ttl: None,
+            log_level: None,
         })
         .await
         .unwrap();

@@ -1,6 +1,7 @@
 pub mod app;
 pub mod cli;
 pub mod config;
+pub mod logging;
 pub mod mappers;
 pub mod model_mapping;
 pub mod models;
