@@ -496,25 +496,6 @@ pub fn gemini_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec
         state.output_tokens = candidates + thoughts;
     }
 
-    if !state.started {
-        state.started = true;
-        let start_chunk = serde_json::json!({
-            "id": &state.completion_id,
-            "object": "chat.completion.chunk",
-            "created": state.created,
-            "model": &state.model,
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "role": "assistant",
-                    "content": ""
-                },
-                "finish_reason": serde_json::Value::Null
-            }]
-        });
-        events.push(format!("data: {start_chunk}\n\n"));
-    }
-
     let candidate = chunk
         .get("response")
         .and_then(|r| r.get("candidates"))
@@ -543,6 +524,10 @@ pub fn gemini_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec
 }
 
 fn finish_openai_gemini_turn(state: &OpenAiStreamState, events: &mut Vec<String>) {
+    let finish_reason = crate::utils::completion_cache::map_gemini_to_openai_finish(
+        state.finish_reason.as_deref(),
+        !state.streamed_tools.is_empty(),
+    );
     let final_chunk = serde_json::json!({
         "id": &state.completion_id,
         "object": "chat.completion.chunk",
@@ -551,7 +536,7 @@ fn finish_openai_gemini_turn(state: &OpenAiStreamState, events: &mut Vec<String>
         "choices": [{
             "index": 0,
             "delta": {},
-            "finish_reason": "stop"
+            "finish_reason": finish_reason
         }]
     });
     events.push(format!("data: {final_chunk}\n\n"));
@@ -1296,6 +1281,9 @@ mod tests {
         let all_text = events.join("\n");
         assert!(all_text.contains("chat.completion.chunk"));
         assert!(all_text.contains("[DONE]"));
+
+        // In TypeScript, no fake start chunk with content: "" is emitted. First chunk has actual content.
+        assert!(!all_text.contains("\"content\":\"\""));
     }
 
     #[test]
@@ -1340,7 +1328,7 @@ mod tests {
                 "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 3 }
             }
         });
-        let _ = gemini_to_openai_sse(&chunk, &mut state);
+        let events = gemini_to_openai_sse(&chunk, &mut state);
         assert_eq!(state.full_text, "hello");
         assert_eq!(state.reasoning, "secret");
         assert_eq!(state.thought_signature, "sig_acc_1");
@@ -1351,6 +1339,16 @@ mod tests {
         assert_eq!(state.output_tokens, 3);
         assert_eq!(state.finish_reason.as_deref(), Some("STOP"));
         assert!(state.finished);
+
+        // Verify the terminal finish chunk has finish_reason: "tool_calls" because tool calls exist
+        let finish_chunk = events
+            .iter()
+            .find(|e| e.contains("\"finish_reason\"") && !e.contains("\"finish_reason\":null"))
+            .expect("must contain a terminal finish chunk");
+        assert!(
+            finish_chunk.contains("\"finish_reason\":\"tool_calls\""),
+            "expected finish_reason: tool_calls, got: {finish_chunk}"
+        );
     }
 
     #[test]
