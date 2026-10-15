@@ -371,6 +371,84 @@ pub fn gemini_stream_entry_from_anthropic(
     )
 }
 
+fn codex_usage(usage: Option<&Value>) -> CompletionUsage {
+    let usage = usage.unwrap_or(&Value::Null);
+    let cached = usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    CompletionUsage {
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .saturating_sub(cached),
+        output_tokens: usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+        cache_read_tokens: cached,
+        cache_write_tokens: 0,
+        reasoning_tokens: usage
+            .get("output_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    }
+}
+
+/// Build a completion entry from an accumulated Codex turn, mirroring the TS Codex `cache.set`.
+/// Returns `None` for unfinished or empty turns.
+#[must_use]
+pub fn codex_completion_entry(
+    text: &str,
+    acc: &crate::utils::sse::CodexAccumulator,
+    model: &str,
+    created: u64,
+    finished: bool,
+) -> Option<CompletionEntry> {
+    if !finished || (text.is_empty() && acc.reasoning.is_empty() && acc.tools.is_empty()) {
+        return None;
+    }
+    let token = if acc.encrypted.is_empty() {
+        String::new()
+    } else {
+        crate::utils::history_cache::mint_reasoning_token(
+            &serde_json::to_string(&acc.encrypted).unwrap_or_default(),
+            &acc.reasoning,
+        )
+    };
+    Some(CompletionEntry {
+        text: text.to_string(),
+        reasoning: if acc.reasoning.is_empty() {
+            None
+        } else {
+            Some(acc.reasoning.clone())
+        },
+        thought_signature: if token.is_empty() { None } else { Some(token) },
+        finish_reason: Some(if acc.tools.is_empty() {
+            "stop".to_string()
+        } else {
+            "tool_calls".to_string()
+        }),
+        tool_calls: if acc.tools.is_empty() {
+            None
+        } else {
+            Some(
+                acc.tools
+                    .iter()
+                    .map(|t| CompletionToolCall {
+                        id: t.id.clone(),
+                        name: t.name.clone(),
+                        arguments: t.args.clone(),
+                    })
+                    .collect(),
+            )
+        },
+        usage: codex_usage(acc.usage.as_ref()),
+        model: model.to_string(),
+        created,
+    })
+}
+
 /// Fetch a fresh full response for a request key.
 #[must_use]
 pub fn lookup_completion(key: &str) -> Option<CompletionEntry> {
@@ -1436,6 +1514,43 @@ mod tests {
         let entry = gemini_stream_entry_from_anthropic(&anthropic, 77).unwrap();
         assert_eq!(entry.created, 77);
         assert_eq!(entry.text, "hi");
+    }
+
+    #[test]
+    fn test_codex_entry_builder_gate_and_shape() {
+        use super::codex_completion_entry;
+        use crate::utils::sse::{CodexAccumulator, CodexToolAssembly};
+        let empty = CodexAccumulator::default();
+        assert!(codex_completion_entry("", &empty, "m", 5, true).is_none());
+        assert!(codex_completion_entry("x", &empty, "m", 5, false).is_none());
+        let acc = CodexAccumulator {
+            tools: vec![CodexToolAssembly {
+                id: "call_ab".to_string(),
+                name: "run".to_string(),
+                args: "{\"c\":\"ls\"}".to_string(),
+            }],
+            index_by_item: std::collections::HashMap::new(),
+            reasoning: "plan".to_string(),
+            encrypted: vec!["blob1".to_string(), "blob2".to_string()],
+            usage: Some(serde_json::json!({
+                "input_tokens": 30,
+                "output_tokens": 12,
+                "input_tokens_details": { "cached_tokens": 10 },
+                "output_tokens_details": { "reasoning_tokens": 3 }
+            })),
+        };
+        let entry = codex_completion_entry("out", &acc, "gpt", 55, true).unwrap();
+        assert_eq!(entry.text, "out");
+        assert_eq!(entry.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(entry.usage.input_tokens, 20);
+        assert_eq!(entry.usage.cache_read_tokens, 10);
+        assert_eq!(entry.usage.reasoning_tokens, 3);
+        assert_eq!(entry.created, 55);
+        let token = entry.thought_signature.expect("encrypted blobs must mint a token");
+        assert!(token.starts_with("pxsig_"));
+        let tc = entry.tool_calls.unwrap();
+        assert_eq!(tc[0].id, "call_ab");
+        assert_eq!(tc[0].arguments, "{\"c\":\"ls\"}");
     }
 
     #[test]

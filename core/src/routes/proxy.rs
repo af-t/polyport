@@ -388,8 +388,12 @@ async fn dispatch_claude_messages(
     }
 }
 
-fn handle_codex_messages_stream(stream_res: CodexStreamResult, model: &str) -> Response {
+fn handle_codex_messages_stream(stream_res: CodexStreamResult, model: &str, cache_key: &str) -> Response {
     let sse_state = AnthropicStreamState::new(&format!("msg_{}", uuid::Uuid::new_v4()), model);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let cache_key = cache_key.to_string();
     stream_sse_transformed(
         stream_res.response.bytes_stream(),
         sse_state,
@@ -400,7 +404,17 @@ fn handle_codex_messages_stream(stream_res: CodexStreamResult, model: &str) -> R
                 Vec::new()
             }
         },
-        None,
+        Some(Box::new(move |state: AnthropicStreamState| {
+            if let Some(entry) = crate::utils::completion_cache::codex_completion_entry(
+                &state.full_text,
+                &state.codex,
+                &state.model,
+                now,
+                state.finished,
+            ) {
+                crate::utils::completion_cache::write_completion_cache(&cache_key, entry);
+            }
+        })),
     )
 }
 
@@ -434,6 +448,7 @@ async fn dispatch_codex_messages(
     model_class: ModelClass,
     preferred_account_id: Option<String>,
     lookup_keys: &[String],
+    cache_key: &str,
 ) -> Response {
     let raw_val = serde_json::to_value(req).unwrap_or_default();
     let responses_body = match map_anthropic_to_responses(&raw_val, Some(upstream_model)) {
@@ -479,7 +494,7 @@ async fn dispatch_codex_messages(
                 guard.record_account_pin(Provider::Codex, lookup_keys, Some(&stream_res.account_id));
             }
             if req.stream.unwrap_or(false) {
-                handle_codex_messages_stream(stream_res, model_name)
+                handle_codex_messages_stream(stream_res, model_name, cache_key)
             } else {
                 handle_codex_messages_buffered(stream_res, model_name).await
             }
@@ -665,6 +680,7 @@ pub async fn v1_messages_handler(State(state): State<AppState>, headers: HeaderM
                 candidate.route.model_class,
                 preferred_account_id,
                 &lookup_keys,
+                &cache_key,
             )
             .await
         }
@@ -1019,8 +1035,9 @@ async fn dispatch_claude_completions(
     }
 }
 
-fn handle_codex_completions_stream(stream_res: CodexStreamResult, model: &str) -> Response {
+fn handle_codex_completions_stream(stream_res: CodexStreamResult, model: &str, cache_key: &str) -> Response {
     let sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), model);
+    let cache_key = cache_key.to_string();
     stream_sse_transformed(
         stream_res.response.bytes_stream(),
         sse_state,
@@ -1031,7 +1048,17 @@ fn handle_codex_completions_stream(stream_res: CodexStreamResult, model: &str) -
                 Vec::new()
             }
         },
-        None,
+        Some(Box::new(move |state: OpenAiStreamState| {
+            if let Some(entry) = crate::utils::completion_cache::codex_completion_entry(
+                &state.full_text,
+                &state.codex,
+                &state.model,
+                state.created,
+                state.finished,
+            ) {
+                crate::utils::completion_cache::write_completion_cache(&cache_key, entry);
+            }
+        })),
     )
 }
 
@@ -1071,6 +1098,7 @@ async fn dispatch_codex_completions(
     model_class: ModelClass,
     preferred_account_id: Option<String>,
     lookup_keys: &[String],
+    cache_key: &str,
 ) -> Response {
     let raw_val = serde_json::to_value(req).unwrap_or_default();
     let responses_body = match map_openai_to_responses(&raw_val, Some(upstream_model)) {
@@ -1116,7 +1144,7 @@ async fn dispatch_codex_completions(
                 guard.record_account_pin(Provider::Codex, lookup_keys, Some(&stream_res.account_id));
             }
             if req.stream.unwrap_or(false) {
-                handle_codex_completions_stream(stream_res, model_name)
+                handle_codex_completions_stream(stream_res, model_name, cache_key)
             } else {
                 handle_codex_completions_buffered(stream_res, model_name).await
             }
@@ -1223,6 +1251,7 @@ pub async fn v1_chat_completions_handler(State(state): State<AppState>, headers:
                 candidate.route.model_class,
                 preferred_account_id,
                 &lookup_keys,
+                &cache_key,
             )
             .await
         }

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 #[must_use]
@@ -39,6 +41,7 @@ pub struct AnthropicStreamState {
     pub full_text: String,
     pub streamed_tools: Vec<GeminiFunctionCall>,
     pub finish_reason: Option<String>,
+    pub codex: CodexAccumulator,
 }
 
 impl AnthropicStreamState {
@@ -60,6 +63,7 @@ impl AnthropicStreamState {
             full_text: String::new(),
             streamed_tools: Vec::new(),
             finish_reason: None,
+            codex: CodexAccumulator::default(),
         }
     }
 }
@@ -272,6 +276,7 @@ pub struct OpenAiStreamState {
     pub finish_reason: Option<String>,
     pub prompt_tokens: u32,
     pub output_tokens: u32,
+    pub codex: CodexAccumulator,
 }
 
 impl OpenAiStreamState {
@@ -296,6 +301,7 @@ impl OpenAiStreamState {
             finish_reason: None,
             prompt_tokens: 0,
             output_tokens: 0,
+            codex: CodexAccumulator::default(),
         }
     }
 }
@@ -562,6 +568,120 @@ pub struct GeminiFunctionCall {
     pub args: Value,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexToolAssembly {
+    pub id: String,
+    pub name: String,
+    pub args: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CodexAccumulator {
+    pub tools: Vec<CodexToolAssembly>,
+    pub index_by_item: HashMap<String, usize>,
+    pub reasoning: String,
+    pub encrypted: Vec<String>,
+    pub usage: Option<Value>,
+}
+
+fn note_codex_item_done(acc: &mut CodexAccumulator, item: Option<&Value>) {
+    let item_type = item.and_then(|i| i.get("type")).and_then(Value::as_str);
+    let str_field = |name: &str| item.and_then(|i| i.get(name)).and_then(Value::as_str);
+    if item_type == Some("function_call") {
+        let item_id = str_field("id");
+        let found = item_id.and_then(|id| acc.index_by_item.get(id)).copied();
+        if let Some(index) = found
+            && let Some(tool) = acc.tools.get_mut(index)
+        {
+            if let Some(args) = str_field("arguments") {
+                tool.args = args.to_string();
+            }
+            if let Some(id) = str_field("call_id") {
+                tool.id = id.to_string();
+            }
+            if let Some(name) = str_field("name") {
+                tool.name = name.to_string();
+            }
+        } else {
+            let index = acc.tools.len();
+            acc.tools.push(CodexToolAssembly {
+                id: str_field("call_id").unwrap_or("").to_string(),
+                name: str_field("name").unwrap_or("").to_string(),
+                args: str_field("arguments").unwrap_or("").to_string(),
+            });
+            if let Some(item_id) = item_id {
+                acc.index_by_item.insert(item_id.to_string(), index);
+            }
+        }
+    } else if item_type == Some("reasoning") {
+        if let Some(blob) = str_field("encrypted_content") {
+            acc.encrypted.push(blob.to_string());
+        }
+        if acc.reasoning.is_empty()
+            && let Some(summary) = item.and_then(|i| i.get("summary")).and_then(Value::as_array)
+        {
+            acc.reasoning = summary
+                .iter()
+                .filter_map(|s| s.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+        }
+    }
+}
+
+/// Observe one Codex Responses frame for later cache populate, mirroring TS `streamCodexResponse`
+/// accumulation. Emission is untouched; this only records.
+pub fn accumulate_codex_frame(acc: &mut CodexAccumulator, text: &mut String, frame: &Value) {
+    match frame.get("type").and_then(Value::as_str).unwrap_or("") {
+        "response.output_text.delta" => {
+            if let Some(delta) = frame.get("delta").and_then(Value::as_str) {
+                text.push_str(delta);
+            }
+        }
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" | "response.thinking_text.delta" => {
+            if let Some(delta) = frame.get("delta").and_then(Value::as_str) {
+                acc.reasoning.push_str(delta);
+            }
+        }
+        "response.output_item.added" => {
+            let item = frame.get("item");
+            if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call") {
+                let index = acc.tools.len();
+                acc.tools.push(CodexToolAssembly {
+                    id: item
+                        .and_then(|i| i.get("call_id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    name: item
+                        .and_then(|i| i.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    args: String::new(),
+                });
+                if let Some(item_id) = item.and_then(|i| i.get("id")).and_then(Value::as_str) {
+                    acc.index_by_item.insert(item_id.to_string(), index);
+                }
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            let delta = frame.get("delta").and_then(Value::as_str).unwrap_or("");
+            if let Some(item_id) = frame.get("item_id").and_then(Value::as_str)
+                && let Some(&index) = acc.index_by_item.get(item_id)
+                && let Some(tool) = acc.tools.get_mut(index)
+            {
+                tool.args.push_str(delta);
+            }
+        }
+        "response.output_item.done" => note_codex_item_done(acc, frame.get("item")),
+        "response.completed" => {
+            acc.usage = frame.get("response").and_then(|r| r.get("usage")).cloned();
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CollectedGemini {
     pub text: String,
@@ -650,6 +770,7 @@ pub fn collect_gemini_response(chunks: &[Value]) -> CollectedGemini {
 #[must_use]
 pub fn codex_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec<String> {
     let mut events = Vec::new();
+    accumulate_codex_frame(&mut state.codex, &mut state.full_text, chunk);
     if !state.started {
         state.started = true;
         let start_chunk = serde_json::json!({
@@ -750,6 +871,7 @@ pub fn codex_to_anthropic_sse(chunk: &Value, state: &mut AnthropicStreamState) -
         events.push(format!("event: message_start\ndata: {start_event}\n\n"));
     }
 
+    accumulate_codex_frame(&mut state.codex, &mut state.full_text, chunk);
     let chunk_type = chunk.get("type").and_then(Value::as_str).unwrap_or("");
     if chunk_type == "response.output_text.delta" {
         if !state.text_block_started {
@@ -944,6 +1066,84 @@ mod tests {
         assert_eq!(state.output_tokens, 3);
         assert_eq!(state.finish_reason.as_deref(), Some("STOP"));
         assert!(state.finished);
+    }
+
+    #[test]
+    fn test_codex_frame_accumulation_mirrors_ts() {
+        let mut acc = CodexAccumulator::default();
+        let mut text = String::new();
+        let frames = [
+            serde_json::json!({ "type": "response.output_text.delta", "delta": "hel" }),
+            serde_json::json!({ "type": "response.output_text.delta", "delta": "lo" }),
+            serde_json::json!({ "type": "response.reasoning_summary_text.delta", "delta": "pla" }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "item": { "type": "function_call", "id": "item1", "call_id": "call_1", "name": "run" }
+            }),
+            serde_json::json!({ "type": "response.function_call_arguments.delta", "item_id": "item1", "delta": "{\"c\":" }),
+            serde_json::json!({ "type": "response.function_call_arguments.delta", "item_id": "item1", "delta": "\"ls\"}" }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": { "type": "function_call", "id": "item1", "call_id": "call_1", "name": "run", "arguments": "{\"c\":\"ls\"}" }
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": { "type": "reasoning", "encrypted_content": "enc1", "summary": [{ "text": "full plan" }] }
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": { "usage": { "input_tokens": 30, "output_tokens": 12 } }
+            }),
+        ];
+        for frame in &frames {
+            accumulate_codex_frame(&mut acc, &mut text, frame);
+        }
+        assert_eq!(text, "hello");
+        assert_eq!(acc.reasoning, "pla");
+        assert_eq!(acc.tools.len(), 1);
+        assert_eq!(acc.tools[0].id, "call_1");
+        assert_eq!(acc.tools[0].name, "run");
+        assert_eq!(acc.tools[0].args, "{\"c\":\"ls\"}");
+        assert_eq!(acc.encrypted, vec!["enc1".to_string()]);
+        assert_eq!(
+            acc.usage
+                .as_ref()
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(Value::as_u64),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn test_codex_done_without_added_still_collects_tool() {
+        let mut acc = CodexAccumulator::default();
+        let mut text = String::new();
+        accumulate_codex_frame(
+            &mut acc,
+            &mut text,
+            &serde_json::json!({
+                "type": "response.output_item.done",
+                "item": { "type": "function_call", "call_id": "call_9", "name": "late", "arguments": "{}" }
+            }),
+        );
+        assert_eq!(acc.tools.len(), 1);
+        assert_eq!(acc.tools[0].id, "call_9");
+    }
+
+    #[test]
+    fn test_codex_translators_feed_the_accumulator() {
+        let mut openai = OpenAiStreamState::new("c", "m");
+        let _ = codex_to_openai_sse(
+            &serde_json::json!({ "type": "response.output_text.delta", "delta": "abc" }),
+            &mut openai,
+        );
+        assert_eq!(openai.full_text, "abc");
+        let mut anthropic = AnthropicStreamState::new("msg", "m");
+        let _ = codex_to_anthropic_sse(
+            &serde_json::json!({ "type": "response.output_text.delta", "delta": "xyz" }),
+            &mut anthropic,
+        );
+        assert_eq!(anthropic.full_text, "xyz");
     }
 
     #[test]
