@@ -55,6 +55,8 @@ pub struct CompletionsRequest {
     pub model: Option<String>,
     pub messages: Option<Vec<Value>>,
     pub stream: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<Value>,
     pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
@@ -388,8 +390,14 @@ async fn dispatch_claude_messages(
     }
 }
 
-fn handle_codex_messages_stream(stream_res: CodexStreamResult, model: &str, cache_key: &str) -> Response {
-    let sse_state = AnthropicStreamState::new(&format!("msg_{}", uuid::Uuid::new_v4()), model);
+fn handle_codex_messages_stream(
+    stream_res: CodexStreamResult,
+    model: &str,
+    cache_key: &str,
+    show_thinking: bool,
+) -> Response {
+    let mut sse_state = AnthropicStreamState::new(&format!("msg_{}", uuid::Uuid::new_v4()), model);
+    sse_state.show_thinking = show_thinking;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -494,7 +502,11 @@ async fn dispatch_codex_messages(
                 guard.record_account_pin(Provider::Codex, lookup_keys, Some(&stream_res.account_id));
             }
             if req.stream.unwrap_or(false) {
-                handle_codex_messages_stream(stream_res, model_name, cache_key)
+                let show_thinking = req
+                    .thinking
+                    .as_ref()
+                    .is_some_and(|t| t.get("type").and_then(Value::as_str) != Some("disabled"));
+                handle_codex_messages_stream(stream_res, model_name, cache_key, show_thinking)
             } else {
                 handle_codex_messages_buffered(stream_res, model_name).await
             }
@@ -1035,8 +1047,16 @@ async fn dispatch_claude_completions(
     }
 }
 
-fn handle_codex_completions_stream(stream_res: CodexStreamResult, model: &str, cache_key: &str) -> Response {
-    let sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), model);
+fn handle_codex_completions_stream(
+    stream_res: CodexStreamResult,
+    model: &str,
+    cache_key: &str,
+    reasoning_excluded: bool,
+    want_usage: bool,
+) -> Response {
+    let mut sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), model);
+    sse_state.reasoning_excluded = reasoning_excluded;
+    sse_state.want_usage = want_usage;
     let cache_key = cache_key.to_string();
     stream_sse_transformed(
         stream_res.response.bytes_stream(),
@@ -1144,7 +1164,19 @@ async fn dispatch_codex_completions(
                 guard.record_account_pin(Provider::Codex, lookup_keys, Some(&stream_res.account_id));
             }
             if req.stream.unwrap_or(false) {
-                handle_codex_completions_stream(stream_res, model_name, cache_key)
+                let want_usage = req
+                    .stream_options
+                    .as_ref()
+                    .and_then(|o| o.get("include_usage"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                handle_codex_completions_stream(
+                    stream_res,
+                    model_name,
+                    cache_key,
+                    reasoning_excluded(req.reasoning.as_ref()),
+                    want_usage,
+                )
             } else {
                 handle_codex_completions_buffered(stream_res, model_name).await
             }

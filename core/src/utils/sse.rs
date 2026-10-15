@@ -25,6 +25,7 @@ pub fn parse_codex_sse_line(line: &str) -> Option<Value> {
     parse_gemini_sse_line(line)
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct AnthropicStreamState {
     pub msg_id: String,
     pub model: String,
@@ -42,6 +43,14 @@ pub struct AnthropicStreamState {
     pub streamed_tools: Vec<GeminiFunctionCall>,
     pub finish_reason: Option<String>,
     pub codex: CodexAccumulator,
+    pub show_thinking: bool,
+    pub open_block: Option<(CodexBlock, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexBlock {
+    Thinking,
+    Text,
 }
 
 impl AnthropicStreamState {
@@ -64,6 +73,8 @@ impl AnthropicStreamState {
             streamed_tools: Vec::new(),
             finish_reason: None,
             codex: CodexAccumulator::default(),
+            show_thinking: false,
+            open_block: None,
         }
     }
 }
@@ -260,6 +271,7 @@ pub fn gemini_to_anthropic_sse(chunk: &Value, state: &mut AnthropicStreamState) 
     events
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct OpenAiStreamState {
     pub completion_id: String,
     pub model: String,
@@ -277,6 +289,7 @@ pub struct OpenAiStreamState {
     pub prompt_tokens: u32,
     pub output_tokens: u32,
     pub codex: CodexAccumulator,
+    pub want_usage: bool,
 }
 
 impl OpenAiStreamState {
@@ -302,6 +315,7 @@ impl OpenAiStreamState {
             prompt_tokens: 0,
             output_tokens: 0,
             codex: CodexAccumulator::default(),
+            want_usage: true,
         }
     }
 }
@@ -767,83 +781,250 @@ pub fn collect_gemini_response(chunks: &[Value]) -> CollectedGemini {
     }
 }
 
+fn codex_openai_chunk(state: &OpenAiStreamState, delta: &Value, finish_reason: &Value) -> String {
+    let chunk = serde_json::json!({
+        "id": &state.completion_id,
+        "object": "chat.completion.chunk",
+        "created": state.created,
+        "model": &state.model,
+        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }]
+    });
+    format!("data: {chunk}\n\n")
+}
+
+fn codex_reasoning_details(format: &str, text: &str, signature: Option<&str>) -> Value {
+    let mut entry =
+        serde_json::json!({ "type": "reasoning.text", "id": Value::Null, "text": text, "format": format, "index": 0 });
+    if let Some(sig) = signature.filter(|s| !s.is_empty()) {
+        entry["signature"] = Value::String(sig.to_string());
+    }
+    Value::Array(vec![entry])
+}
+
+fn codex_minted_token(acc: &CodexAccumulator) -> String {
+    if acc.encrypted.is_empty() {
+        return String::new();
+    }
+    crate::utils::history_cache::mint_reasoning_token(
+        &serde_json::to_string(&acc.encrypted).unwrap_or_default(),
+        &acc.reasoning,
+    )
+}
+
+fn codex_openai_usage(usage: Option<&Value>) -> Value {
+    let usage = usage.unwrap_or(&Value::Null);
+    let cached = usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let prompt = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let output = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let reasoning = usage
+        .get("output_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let prompt_details = serde_json::json!({ "cached_tokens": cached, "audio_tokens": 0 });
+    serde_json::json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": output,
+        "total_tokens": prompt + output,
+        "prompt_tokens_details": prompt_details,
+        "completion_tokens_details": {
+            "reasoning_tokens": reasoning,
+            "audio_tokens": 0,
+            "accepted_prediction_tokens": 0,
+            "rejected_prediction_tokens": 0
+        }
+    })
+}
+
 #[must_use]
 pub fn codex_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec<String> {
     let mut events = Vec::new();
     accumulate_codex_frame(&mut state.codex, &mut state.full_text, chunk);
     if !state.started {
         state.started = true;
-        let start_chunk = serde_json::json!({
-            "id": &state.completion_id,
-            "object": "chat.completion.chunk",
-            "created": state.created,
-            "model": &state.model,
-            "choices": [{
-                "index": 0,
-                "delta": { "role": "assistant", "content": "" },
-                "finish_reason": serde_json::Value::Null
-            }]
-        });
-        events.push(format!("data: {start_chunk}\n\n"));
+        let start_delta = serde_json::json!({ "role": "assistant", "content": "" });
+        events.push(codex_openai_chunk(state, &start_delta, &Value::Null));
     }
 
     let chunk_type = chunk.get("type").and_then(Value::as_str).unwrap_or("");
-    if chunk_type == "response.output_text.delta" {
-        if let Some(text) = chunk.get("delta").and_then(Value::as_str) {
-            let text_chunk = serde_json::json!({
-                "id": &state.completion_id,
-                "object": "chat.completion.chunk",
-                "created": state.created,
-                "model": &state.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "content": text
-                    },
-                    "finish_reason": serde_json::Value::Null
-                }]
-            });
-            events.push(format!("data: {text_chunk}\n\n"));
+    match chunk_type {
+        "response.output_text.delta" => {
+            if let Some(text) = chunk.get("delta").and_then(Value::as_str) {
+                let delta = serde_json::json!({ "content": text });
+                events.push(codex_openai_chunk(state, &delta, &Value::Null));
+            }
         }
-    } else if chunk_type == "response.function_call_arguments.delta" {
-        if let Some(args_delta) = chunk.get("delta").and_then(Value::as_str) {
-            let tc_chunk = serde_json::json!({
-                "id": &state.completion_id,
-                "object": "chat.completion.chunk",
-                "created": state.created,
-                "model": &state.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "tool_calls": [{
-                            "index": 0,
-                            "function": {
-                                "arguments": args_delta
-                            }
-                        }]
-                    },
-                    "finish_reason": serde_json::Value::Null
-                }]
-            });
-            events.push(format!("data: {tc_chunk}\n\n"));
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" | "response.thinking_text.delta" => {
+            if !state.reasoning_excluded
+                && let Some(text) = chunk.get("delta").and_then(Value::as_str)
+            {
+                let format = reasoning_format_for(&state.model);
+                let delta = serde_json::json!({
+                    "reasoning": text,
+                    "reasoning_content": text,
+                    "reasoning_details": codex_reasoning_details(format, text, None)
+                });
+                events.push(codex_openai_chunk(state, &delta, &Value::Null));
+            }
         }
-    } else if chunk_type == "response.completed" && !state.finished {
-        state.finished = true;
-        let finish_chunk = serde_json::json!({
-            "id": &state.completion_id,
-            "object": "chat.completion.chunk",
-            "created": state.created,
-            "model": &state.model,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop"
-            }]
-        });
-        events.push(format!("data: {finish_chunk}\n\n"));
-        events.push("data: [DONE]\n\n".to_string());
+        "response.output_item.done" => {
+            let item = chunk.get("item");
+            if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call")
+                && let Some(item_id) = item.and_then(|i| i.get("id")).and_then(Value::as_str)
+                && let Some(&index) = state.codex.index_by_item.get(item_id)
+                && let Some(tool) = state.codex.tools.get(index)
+            {
+                let delta = serde_json::json!({
+                    "tool_calls": [{
+                        "index": index,
+                        "id": tool.id,
+                        "type": "function",
+                        "function": { "name": tool.name, "arguments": tool.args }
+                    }]
+                });
+                events.push(codex_openai_chunk(state, &delta, &Value::Null));
+            }
+        }
+        "response.completed" if !state.finished => {
+            state.finished = true;
+            let finish = if state.codex.tools.is_empty() {
+                "stop"
+            } else {
+                "tool_calls"
+            };
+            let mut delta = serde_json::json!({});
+            if !state.reasoning_excluded {
+                let token = codex_minted_token(&state.codex);
+                if !token.is_empty() {
+                    let format = reasoning_format_for(&state.model);
+                    delta = serde_json::json!({
+                        "reasoning_details": codex_reasoning_details(format, "", Some(&token))
+                    });
+                }
+            }
+            let finish_value = Value::String(finish.to_string());
+            events.push(codex_openai_chunk(state, &delta, &finish_value));
+            if state.want_usage {
+                let chunk = serde_json::json!({
+                    "id": &state.completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": state.created,
+                    "model": &state.model,
+                    "choices": [],
+                    "usage": codex_openai_usage(state.codex.usage.as_ref())
+                });
+                events.push(format!("data: {chunk}\n\n"));
+            }
+            events.push("data: [DONE]\n\n".to_string());
+        }
+        _ => {}
     }
     events
+}
+
+fn codex_anthropic_event(event_type: &str, data: &Value) -> String {
+    format!("event: {event_type}\ndata: {data}\n\n")
+}
+
+fn ensure_codex_block(state: &mut AnthropicStreamState, kind: CodexBlock, events: &mut Vec<String>) {
+    if state.open_block.is_some_and(|(open, _)| open == kind) {
+        return;
+    }
+    close_codex_block(state, events, None);
+    let index = state.block_index;
+    state.block_index += 1;
+    let content_block = match kind {
+        CodexBlock::Thinking => serde_json::json!({ "type": "thinking", "thinking": "" }),
+        CodexBlock::Text => serde_json::json!({ "type": "text", "text": "" }),
+    };
+    events.push(codex_anthropic_event(
+        "content_block_start",
+        &serde_json::json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": content_block
+        }),
+    ));
+    state.open_block = Some((kind, index));
+}
+
+fn open_codex_index(state: &AnthropicStreamState) -> usize {
+    state.open_block.map_or(0, |(_, index)| index)
+}
+
+fn emit_codex_tool_block(state: &mut AnthropicStreamState, item: Option<&Value>, events: &mut Vec<String>) {
+    close_codex_block(state, events, None);
+    let tool_index = state.block_index;
+    state.block_index += 1;
+    let item_id = item.and_then(|i| i.get("id")).and_then(Value::as_str);
+    let found = item_id
+        .and_then(|id| state.codex.index_by_item.get(id))
+        .copied()
+        .and_then(|index| state.codex.tools.get(index))
+        .map(|tool| (tool.id.clone(), tool.name.clone(), tool.args.clone()));
+    if let Some((id, name, args)) = found {
+        events.push(codex_anthropic_event(
+            "content_block_start",
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": tool_index,
+                "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} }
+            }),
+        ));
+        events.push(codex_anthropic_event(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": tool_index,
+                "delta": { "type": "input_json_delta", "partial_json": args }
+            }),
+        ));
+        events.push(codex_anthropic_event(
+            "content_block_stop",
+            &serde_json::json!({ "type": "content_block_stop", "index": tool_index }),
+        ));
+    }
+}
+
+fn close_codex_block(state: &mut AnthropicStreamState, events: &mut Vec<String>, signature: Option<&str>) {
+    let Some((open, index)) = state.open_block else { return };
+    if open == CodexBlock::Thinking {
+        let sig = signature
+            .filter(|s| !s.is_empty())
+            .unwrap_or(crate::utils::history_cache::DUMMY_SIGNATURE);
+        events.push(codex_anthropic_event(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": { "type": "signature_delta", "signature": sig }
+            }),
+        ));
+    }
+    events.push(codex_anthropic_event(
+        "content_block_stop",
+        &serde_json::json!({ "type": "content_block_stop", "index": index }),
+    ));
+    state.open_block = None;
+}
+
+fn codex_delta_usage(usage: Option<&Value>) -> Value {
+    let usage = usage.unwrap_or(&Value::Null);
+    let cached = usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    serde_json::json!({
+        "input_tokens": usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": cached,
+        "output_tokens": usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
+    })
 }
 
 #[must_use]
@@ -862,91 +1043,78 @@ pub fn codex_to_anthropic_sse(chunk: &Value, state: &mut AnthropicStreamState) -
                 "content": [],
                 "stop_reason": serde_json::Value::Null,
                 "stop_sequence": serde_json::Value::Null,
-                "usage": {
-                    "input_tokens": state.input_tokens,
-                    "output_tokens": 0
-                }
+                "usage": { "input_tokens": 0, "output_tokens": 0 }
             }
         });
-        events.push(format!("event: message_start\ndata: {start_event}\n\n"));
+        events.push(codex_anthropic_event("message_start", &start_event));
     }
 
     accumulate_codex_frame(&mut state.codex, &mut state.full_text, chunk);
     let chunk_type = chunk.get("type").and_then(Value::as_str).unwrap_or("");
-    if chunk_type == "response.output_text.delta" {
-        if !state.text_block_started {
-            state.text_block_started = true;
-            let block_start = serde_json::json!({
-                "type": "content_block_start",
-                "index": state.block_index,
-                "content_block": { "type": "text", "text": "" }
-            });
-            events.push(format!("event: content_block_start\ndata: {block_start}\n\n"));
+    match chunk_type {
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" | "response.thinking_text.delta" => {
+            if state.show_thinking
+                && let Some(text) = chunk.get("delta").and_then(Value::as_str)
+            {
+                ensure_codex_block(state, CodexBlock::Thinking, &mut events);
+                let index = open_codex_index(state);
+                events.push(codex_anthropic_event(
+                    "content_block_delta",
+                    &serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": { "type": "thinking_delta", "thinking": text }
+                    }),
+                ));
+            }
         }
-        if let Some(text) = chunk.get("delta").and_then(Value::as_str) {
-            let delta = serde_json::json!({
-                "type": "content_block_delta",
-                "index": state.block_index,
-                "delta": { "type": "text_delta", "text": text }
-            });
-            events.push(format!("event: content_block_delta\ndata: {delta}\n\n"));
+        "response.output_text.delta" => {
+            ensure_codex_block(state, CodexBlock::Text, &mut events);
+            let index = open_codex_index(state);
+            if let Some(text) = chunk.get("delta").and_then(Value::as_str) {
+                events.push(codex_anthropic_event(
+                    "content_block_delta",
+                    &serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": { "type": "text_delta", "text": text }
+                    }),
+                ));
+            }
         }
-    } else if chunk_type == "response.output_item.added" {
-        let is_func = chunk.get("item").and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call");
-        if is_func {
-            let item = &chunk["item"];
-            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-            let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
-            let block_start = serde_json::json!({
-                "type": "content_block_start",
-                "index": state.block_index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": call_id,
-                    "name": name,
-                    "input": {}
+        "response.output_item.done" => {
+            let item = chunk.get("item");
+            if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call") {
+                emit_codex_tool_block(state, item, &mut events);
+            } else if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("reasoning") {
+                if state.show_thinking && state.open_block.is_some_and(|(open, _)| open == CodexBlock::Thinking) {
+                    let token = codex_minted_token(&state.codex);
+                    let token_opt = if token.is_empty() { None } else { Some(token.as_str()) };
+                    close_codex_block(state, &mut events, token_opt);
+                } else {
+                    close_codex_block(state, &mut events, None);
                 }
-            });
-            events.push(format!("event: content_block_start\ndata: {block_start}\n\n"));
+            }
         }
-    } else if chunk_type == "response.function_call_arguments.delta" {
-        if let Some(args_delta) = chunk.get("delta").and_then(Value::as_str) {
-            let delta = serde_json::json!({
-                "type": "content_block_delta",
-                "index": state.block_index,
-                "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": args_delta
-                }
-            });
-            events.push(format!("event: content_block_delta\ndata: {delta}\n\n"));
+        "response.completed" if !state.finished => {
+            state.finished = true;
+            close_codex_block(state, &mut events, None);
+            let finish = if state.codex.tools.is_empty() {
+                "end_turn"
+            } else {
+                "tool_use"
+            };
+            events.push(codex_anthropic_event(
+                "message_delta",
+                &serde_json::json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": finish, "stop_sequence": Value::Null },
+                    "usage": codex_delta_usage(state.codex.usage.as_ref())
+                }),
+            ));
+            events.push("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string());
         }
-    } else if chunk_type == "response.output_item.done" {
-        let is_func = chunk.get("item").and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call");
-        if is_func {
-            let block_stop = serde_json::json!({
-                "type": "content_block_stop",
-                "index": state.block_index
-            });
-            events.push(format!("event: content_block_stop\ndata: {block_stop}\n\n"));
-            state.block_index += 1;
-        }
-    } else if chunk_type == "response.completed" && !state.finished {
-        state.finished = true;
-        if state.text_block_started {
-            let block_stop = serde_json::json!({
-                "type": "content_block_stop",
-                "index": state.block_index
-            });
-            events.push(format!("event: content_block_stop\ndata: {block_stop}\n\n"));
-        }
-        let msg_delta = serde_json::json!({
-            "type": "message_delta",
-            "delta": { "stop_reason": "end_turn", "stop_sequence": serde_json::Value::Null },
-            "usage": { "output_tokens": state.output_tokens }
-        });
-        events.push(format!("event: message_delta\ndata: {msg_delta}\n\n"));
-        events.push("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string());
+        _ => {}
     }
 
     events
@@ -1270,6 +1438,170 @@ mod tests {
         assert!(all_text.contains("chat.completion.chunk"));
         assert!(all_text.contains("hello anthropic"));
         assert!(all_text.contains("[DONE]"));
+    }
+
+    fn codex_data(event: &str) -> serde_json::Value {
+        let line = event.lines().find(|l| l.starts_with("data:")).unwrap();
+        serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap()
+    }
+
+    #[test]
+    fn test_codex_openai_emits_reasoning_deltas() {
+        let mut state = OpenAiStreamState::new("c", "gpt-5.6-luna");
+        let events = codex_to_openai_sse(
+            &serde_json::json!({ "type": "response.reasoning_summary_text.delta", "delta": "plan" }),
+            &mut state,
+        );
+        assert_eq!(events.len(), 2);
+        let delta = codex_data(&events[1])
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("delta"))
+            .unwrap()
+            .clone();
+        assert_eq!(delta.get("reasoning").and_then(Value::as_str), Some("plan"));
+        assert_eq!(
+            delta
+                .get("reasoning_details")
+                .and_then(|d| d.get(0))
+                .and_then(|d| d.get("format"))
+                .and_then(Value::as_str),
+            Some("openai-codex-v1")
+        );
+    }
+
+    #[test]
+    fn test_codex_openai_respects_reasoning_excluded() {
+        let mut state = OpenAiStreamState::new("c", "gpt-5.6-luna");
+        state.reasoning_excluded = true;
+        let events = codex_to_openai_sse(
+            &serde_json::json!({ "type": "response.reasoning_summary_text.delta", "delta": "plan" }),
+            &mut state,
+        );
+        assert!(events.iter().all(|e| !e.contains("reasoning")));
+    }
+
+    #[test]
+    fn test_codex_openai_emits_whole_tool_at_done() {
+        let mut state = OpenAiStreamState::new("c", "gpt-5.6-luna");
+        let frames = [
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "item": { "type": "function_call", "id": "i1", "call_id": "call_1", "name": "run" }
+            }),
+            serde_json::json!({ "type": "response.function_call_arguments.delta", "item_id": "i1", "delta": "{\"a\":" }),
+            serde_json::json!({ "type": "response.function_call_arguments.delta", "item_id": "i1", "delta": "1}" }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": { "type": "function_call", "id": "i1", "call_id": "call_1", "name": "run", "arguments": "{\"a\":1}" }
+            }),
+        ];
+        let mut tool_chunks = 0;
+        for frame in &frames {
+            for event in codex_to_openai_sse(frame, &mut state) {
+                let data = codex_data(&event);
+                if data
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("tool_calls"))
+                    .is_some()
+                {
+                    tool_chunks += 1;
+                    let tc = data
+                        .get("choices")
+                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get("delta"))
+                        .and_then(|d| d.get("tool_calls"))
+                        .and_then(|t| t.get(0))
+                        .unwrap();
+                    assert_eq!(tc.get("id").and_then(Value::as_str), Some("call_1"));
+                    assert_eq!(
+                        tc.get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(Value::as_str),
+                        Some("{\"a\":1}")
+                    );
+                }
+            }
+        }
+        assert_eq!(tool_chunks, 1);
+    }
+
+    #[test]
+    fn test_codex_openai_completed_maps_finish_and_usage() {
+        let mut state = OpenAiStreamState::new("c", "gpt-5.6-luna");
+        let _ = codex_to_openai_sse(
+            &serde_json::json!({
+                "type": "response.output_item.done",
+                "item": { "type": "function_call", "call_id": "call_1", "name": "run", "arguments": "{}" }
+            }),
+            &mut state,
+        );
+        let events = codex_to_openai_sse(
+            &serde_json::json!({
+                "type": "response.completed",
+                "response": { "usage": { "input_tokens": 20, "output_tokens": 8 } }
+            }),
+            &mut state,
+        );
+        let joined = events.join("\n");
+        assert!(joined.contains("\"finish_reason\":\"tool_calls\""));
+        assert!(joined.contains("\"prompt_tokens\":20"));
+        assert!(joined.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn test_codex_anthropic_thinking_block_lifecycle() {
+        let mut state = AnthropicStreamState::new("msg", "gpt-5.6-luna");
+        state.show_thinking = true;
+        let mut all = Vec::new();
+        for frame in [
+            serde_json::json!({ "type": "response.reasoning_summary_text.delta", "delta": "hmm" }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": { "type": "reasoning", "encrypted_content": "enc9", "summary": [] }
+            }),
+        ] {
+            all.extend(codex_to_anthropic_sse(&frame, &mut state));
+        }
+        let joined = all.join("\n");
+        assert!(joined.contains("thinking_delta"));
+        assert!(joined.contains("signature_delta"));
+        assert!(joined.contains("pxsig_"));
+        assert!(!joined.contains("dummy_sig_from_proxy"));
+    }
+
+    #[test]
+    fn test_codex_anthropic_hides_thinking_when_disabled() {
+        let mut state = AnthropicStreamState::new("msg", "gpt-5.6-luna");
+        let events = codex_to_anthropic_sse(
+            &serde_json::json!({ "type": "response.reasoning_summary_text.delta", "delta": "hmm" }),
+            &mut state,
+        );
+        assert!(events.iter().all(|e| !e.contains("thinking")));
+    }
+
+    #[test]
+    fn test_codex_anthropic_tool_blocks_indexed_after_text() {
+        let mut state = AnthropicStreamState::new("msg", "gpt-5.6-luna");
+        let mut all = Vec::new();
+        for frame in [
+            serde_json::json!({ "type": "response.output_text.delta", "delta": "hi" }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": { "type": "function_call", "id": "i1", "call_id": "call_7", "name": "run", "arguments": "{}" }
+            }),
+            serde_json::json!({ "type": "response.completed", "response": { "usage": {} } }),
+        ] {
+            all.extend(codex_to_anthropic_sse(&frame, &mut state));
+        }
+        let joined = all.join("\n");
+        assert!(joined.contains("\"index\":0"));
+        assert!(joined.contains("\"index\":1"));
+        assert!(joined.contains("\"stop_reason\":\"tool_use\""));
+        assert!(joined.contains("input_json_delta"));
+        assert!(joined.contains("call_7"));
     }
 
     #[test]
