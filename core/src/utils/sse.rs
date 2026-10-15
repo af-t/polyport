@@ -25,12 +25,19 @@ pub fn parse_codex_sse_line(line: &str) -> Option<Value> {
     parse_gemini_sse_line(line)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicBlockKind {
+    None,
+    Thinking,
+    Text,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct AnthropicStreamState {
     pub msg_id: String,
     pub model: String,
     pub started: bool,
-    pub text_block_started: bool,
+    pub block_kind: AnthropicBlockKind,
     pub block_index: usize,
     pub finished: bool,
     pub input_tokens: u32,
@@ -61,7 +68,7 @@ impl AnthropicStreamState {
             msg_id: msg_id.to_string(),
             model: model.to_string(),
             started: false,
-            text_block_started: false,
+            block_kind: AnthropicBlockKind::None,
             block_index: 0,
             finished: false,
             input_tokens: 0,
@@ -115,35 +122,98 @@ fn note_tool_call(state_sig: &str, tool_ids: &mut Vec<String>, tool_id: &str) {
     crate::utils::history_cache::record_tool_signature(tool_id, state_sig, "");
 }
 
+fn close_anthropic_block(state: &mut AnthropicStreamState, events: &mut Vec<String>) {
+    match state.block_kind {
+        AnthropicBlockKind::None => {}
+        AnthropicBlockKind::Thinking => {
+            let sig = if state.thought_signature.is_empty() {
+                crate::utils::history_cache::DUMMY_SIGNATURE
+            } else {
+                &state.thought_signature
+            };
+            let token = crate::utils::history_cache::mint_reasoning_token(sig, &state.reasoning);
+            let client_sig = if token.is_empty() { sig } else { &token };
+            let sig_delta = serde_json::json!({
+                "type": "content_block_delta",
+                "index": state.block_index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": client_sig
+                }
+            });
+            events.push(format!("event: content_block_delta\ndata: {sig_delta}\n\n"));
+            let block_stop = serde_json::json!({
+                "type": "content_block_stop",
+                "index": state.block_index
+            });
+            events.push(format!("event: content_block_stop\ndata: {block_stop}\n\n"));
+            state.block_kind = AnthropicBlockKind::None;
+            state.block_index += 1;
+        }
+        AnthropicBlockKind::Text => {
+            let block_stop = serde_json::json!({
+                "type": "content_block_stop",
+                "index": state.block_index
+            });
+            events.push(format!("event: content_block_stop\ndata: {block_stop}\n\n"));
+            state.block_kind = AnthropicBlockKind::None;
+            state.block_index += 1;
+        }
+    }
+}
+
 fn gemini_part_to_anthropic(part: &Value, state: &mut AnthropicStreamState) -> Vec<String> {
     let mut events = Vec::new();
     let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
     if let Some(text) = part.get("text").and_then(Value::as_str) {
-        if !is_thought {
-            state.full_text.push_str(text);
-        }
-        if !state.text_block_started {
-            state.text_block_started = true;
-            let block_start = serde_json::json!({
-                "type": "content_block_start",
+        if is_thought {
+            if state.block_kind != AnthropicBlockKind::Thinking {
+                close_anthropic_block(state, &mut events);
+                state.block_kind = AnthropicBlockKind::Thinking;
+                let block_start = serde_json::json!({
+                    "type": "content_block_start",
+                    "index": state.block_index,
+                    "content_block": {
+                        "type": "thinking",
+                        "thinking": ""
+                    }
+                });
+                events.push(format!("event: content_block_start\ndata: {block_start}\n\n"));
+            }
+            let delta = serde_json::json!({
+                "type": "content_block_delta",
                 "index": state.block_index,
-                "content_block": {
-                    "type": "text",
-                    "text": ""
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": text
                 }
             });
-            events.push(format!("event: content_block_start\ndata: {block_start}\n\n"));
-        }
-
-        let delta = serde_json::json!({
-            "type": "content_block_delta",
-            "index": state.block_index,
-            "delta": {
-                "type": "text_delta",
-                "text": text
+            events.push(format!("event: content_block_delta\ndata: {delta}\n\n"));
+        } else {
+            state.full_text.push_str(text);
+            if state.block_kind != AnthropicBlockKind::Text {
+                close_anthropic_block(state, &mut events);
+                state.block_kind = AnthropicBlockKind::Text;
+                let block_start = serde_json::json!({
+                    "type": "content_block_start",
+                    "index": state.block_index,
+                    "content_block": {
+                        "type": "text",
+                        "text": ""
+                    }
+                });
+                events.push(format!("event: content_block_start\ndata: {block_start}\n\n"));
             }
-        });
-        events.push(format!("event: content_block_delta\ndata: {delta}\n\n"));
+            let delta = serde_json::json!({
+                "type": "content_block_delta",
+                "index": state.block_index,
+                "delta": {
+                    "type": "text_delta",
+                    "text": text
+                }
+            });
+            events.push(format!("event: content_block_delta\ndata: {delta}\n\n"));
+        }
     }
 
     note_part_signature(
@@ -154,6 +224,7 @@ fn gemini_part_to_anthropic(part: &Value, state: &mut AnthropicStreamState) -> V
         part,
     );
     if let Some(fc) = part.get("functionCall") {
+        close_anthropic_block(state, &mut events);
         let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
         let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
         state.streamed_tools.push(GeminiFunctionCall {
@@ -257,18 +328,17 @@ pub fn gemini_to_anthropic_sse(chunk: &Value, state: &mut AnthropicStreamState) 
     if (finish_reason.is_some() || chunk.get("response").is_none()) && !state.finished {
         state.finished = true;
         state.finish_reason = finish_reason.map(str::to_string);
-        if state.text_block_started {
-            let block_stop = serde_json::json!({
-                "type": "content_block_stop",
-                "index": state.block_index
-            });
-            events.push(format!("event: content_block_stop\ndata: {block_stop}\n\n"));
-        }
+        close_anthropic_block(state, &mut events);
+
+        let stop_reason = crate::utils::completion_cache::map_gemini_to_anthropic_stop(
+            state.finish_reason.as_deref(),
+            !state.streamed_tools.is_empty(),
+        );
 
         let msg_delta = serde_json::json!({
             "type": "message_delta",
             "delta": {
-                "stop_reason": "end_turn",
+                "stop_reason": stop_reason,
                 "stop_sequence": serde_json::Value::Null
             },
             "usage": {
@@ -1246,12 +1316,13 @@ mod tests {
         let chunk = serde_json::json!({
             "response": {
                 "candidates": [{
-                    "content": { "parts": [{ "text": "hello" }] },
+                    "content": { "parts": [{ "text": "thinking...", "thought": true }, { "text": "hello" }] },
                     "finishReason": "STOP"
                 }],
                 "usageMetadata": {
                     "promptTokenCount": 10,
-                    "candidatesTokenCount": 2
+                    "candidatesTokenCount": 2,
+                    "thoughtsTokenCount": 1
                 }
             }
         });
@@ -1260,8 +1331,42 @@ mod tests {
         assert_ne!(events.len(), 0);
         let all_text = events.join("\n");
         assert!(all_text.contains("message_start"));
-        assert!(all_text.contains("content_block_delta"));
+        assert!(all_text.contains("\"type\":\"thinking\""));
+        assert!(all_text.contains("\"type\":\"thinking_delta\""));
+        assert!(all_text.contains("\"type\":\"signature_delta\""));
+        assert!(all_text.contains("\"type\":\"text\""));
+        assert!(all_text.contains("\"type\":\"text_delta\""));
+        assert!(all_text.contains("\"stop_reason\":\"end_turn\""));
         assert!(all_text.contains("message_stop"));
+    }
+
+    #[test]
+    fn test_gemini_to_anthropic_sse_tool_stop_reason() {
+        let mut state = AnthropicStreamState::new("test-msg", "gemini-3.5-flash");
+        let chunk = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "parts": [{
+                            "functionCall": {
+                                "name": "runShell",
+                                "args": { "command": "ls" }
+                            }
+                        }]
+                    },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 5
+                }
+            }
+        });
+
+        let events = gemini_to_anthropic_sse(&chunk, &mut state);
+        let all_text = events.join("\n");
+        assert!(all_text.contains("\"type\":\"tool_use\""));
+        assert!(all_text.contains("\"stop_reason\":\"tool_use\""));
     }
 
     #[test]

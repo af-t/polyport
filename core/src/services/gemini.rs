@@ -63,7 +63,9 @@ pub fn build_generation_config(body: &Value, resolved_model: &str, is_thinking_r
         .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(default_max_tokens);
 
-    let mut max_output_tokens = requested_max_tokens.max(256);
+    let mut max_output_tokens = requested_max_tokens
+        .max(256)
+        .min(max_gemini_output_tokens(resolved_model));
     let temperature = body.get("temperature").and_then(Value::as_f64).or(Some(0.7));
     let top_p = body.get("top_p").and_then(Value::as_f64);
     let top_k = body.get("top_k").and_then(Value::as_u64);

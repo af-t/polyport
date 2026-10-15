@@ -214,9 +214,11 @@ async fn handle_gemini_messages_buffered(
     if !res.text.is_empty() {
         content.push(serde_json::json!({ "type": "text", "text": res.text }));
     }
-    let mut stop_reason = res.finish_reason.unwrap_or_else(|| "end_turn".to_string());
+    let stop_reason = crate::utils::completion_cache::map_gemini_to_anthropic_stop(
+        res.finish_reason.as_deref(),
+        !res.function_calls.is_empty(),
+    );
     if !res.function_calls.is_empty() {
-        stop_reason = "tool_use".to_string();
         for fc in res.function_calls {
             let tool_id = format!("call_{}", uuid::Uuid::new_v4().simple());
             if let Some(sig) = res.thought_signature.as_deref() {
@@ -267,9 +269,25 @@ async fn dispatch_gemini_messages(
         )
         .is_some()
         || crate::config::model_supports_thinking(&route.upstream_model);
-    let system_str = match &req.system {
-        Some(Value::String(s)) => Some(s.as_str()),
-        _ => None,
+    let mut system_buf = String::new();
+    if let Some(sys) = &req.system {
+        if let Some(s) = sys.as_str() {
+            system_buf.push_str(s);
+        } else if let Some(arr) = sys.as_array() {
+            for block in arr {
+                if let Some(txt) = block.get("text").and_then(Value::as_str) {
+                    if !system_buf.is_empty() {
+                        system_buf.push_str("\n\n");
+                    }
+                    system_buf.push_str(txt);
+                }
+            }
+        }
+    }
+    let system_str = if system_buf.is_empty() {
+        None
+    } else {
+        Some(system_buf.as_str())
     };
     let raw_val = serde_json::to_value(req).unwrap_or_default();
     let messages_val = serde_json::to_value(&req.messages).unwrap_or_default();
@@ -826,9 +844,11 @@ async fn handle_gemini_completions_buffered(
         }
         message["reasoning_details"] = Value::Array(vec![entry]);
     }
-    let mut finish_reason = "stop";
+    let finish_reason = crate::utils::completion_cache::map_gemini_to_openai_finish(
+        res.finish_reason.as_deref(),
+        !res.function_calls.is_empty(),
+    );
     if !res.function_calls.is_empty() {
-        finish_reason = "tool_calls";
         let tool_calls: Vec<Value> = res
             .function_calls
             .iter()

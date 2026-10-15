@@ -421,7 +421,7 @@ pub fn map_messages_to_gemini(
         let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
         let content_val = m.get("content").unwrap_or(&Value::Null);
 
-        if role == "system" {
+        if role == "system" || role == "developer" {
             push_system_text(&mut system_texts, content_val);
             continue;
         }
