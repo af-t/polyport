@@ -1,4 +1,5 @@
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -10,7 +11,7 @@ use crate::app::AppState;
 use crate::config::RouteDecision;
 use crate::mappers::codex::{map_anthropic_to_responses, map_openai_to_responses};
 use crate::mappers::gemini::{map_anthropic_tools_for_gemini, map_messages_to_gemini, map_openai_tools_for_gemini};
-use crate::model_mapping::{MappingEndpoint, resolve_route_candidates};
+use crate::model_mapping::{MappingEndpoint, get_route_fingerprint, resolve_route_candidates};
 use crate::services::account_pool::AttemptError;
 use crate::services::anthropic::{
     CallClaudeParams, ClaudeStreamResult, apply_thinking_constraints, call_claude_stream, map_anthropic_model,
@@ -19,6 +20,10 @@ use crate::services::anthropic::{
 use crate::services::codex::{CallCodexParams, CodexStreamResult, call_codex_stream};
 use crate::services::gemini::{CallGeminiParams, GeminiStreamResult, build_generation_config, call_gemini_stream};
 use crate::types::{ModelClass, Provider};
+use crate::utils::completion_cache::{
+    completion_key, lookup_completion, replay_completions_json, replay_completions_stream, replay_messages_json,
+    replay_messages_stream,
+};
 use crate::utils::history_cache::{mint_reasoning_token, record_history, record_tool_signature};
 use crate::utils::sse::reasoning_format_for;
 use crate::utils::sse::{
@@ -431,19 +436,76 @@ async fn dispatch_codex_messages(
     }
 }
 
-pub async fn v1_messages_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Result<Json<MessagesRequest>, axum::extract::rejection::JsonRejection>,
+fn invalid_body_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": { "message": "Invalid JSON request body", "type": "invalid_request_error" }
+        })),
+    )
+        .into_response()
+}
+
+fn cache_bypassed(headers: &HeaderMap) -> bool {
+    headers
+        .get("cache-control")
+        .is_some_and(|v| v.as_bytes() == b"no-cache")
+}
+
+fn sse_hit_response(events: &[String]) -> Response {
+    Response::builder()
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("X-Cache", "HIT")
+        .body(axum::body::Body::from(events.concat()))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
+}
+
+fn json_hit_response(value: &Value) -> Response {
+    Response::builder()
+        .header("Content-Type", "application/json")
+        .header("X-Cache", "HIT")
+        .status(StatusCode::OK)
+        .body(axum::body::Body::from(value.to_string()))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
+}
+
+fn messages_hit_response(req: &MessagesRequest, entry: &crate::utils::completion_cache::CompletionEntry) -> Response {
+    let excluded = reasoning_excluded(req.reasoning.as_ref());
+    if req.stream.unwrap_or(false) {
+        sse_hit_response(&replay_messages_stream(entry, excluded))
+    } else {
+        json_hit_response(&replay_messages_json(entry, excluded))
+    }
+}
+
+fn completions_hit_response(
+    raw: &Value,
+    req: &CompletionsRequest,
+    entry: &crate::utils::completion_cache::CompletionEntry,
 ) -> Response {
-    let Ok(Json(req)) = body else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": { "message": "Invalid JSON request body", "type": "invalid_request_error" }
-            })),
-        )
-            .into_response();
+    let excluded = reasoning_excluded(req.reasoning.as_ref());
+    let format = reasoning_format_for(req.model.as_deref().unwrap_or(""));
+    if req.stream.unwrap_or(false) {
+        let want_usage = raw
+            .get("stream_options")
+            .and_then(|o| o.get("include_usage"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        sse_hit_response(&replay_completions_stream(entry, format, excluded, want_usage))
+    } else {
+        json_hit_response(&replay_completions_json(entry, format, excluded))
+    }
+}
+
+pub async fn v1_messages_handler(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let raw: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return invalid_body_response(),
+    };
+    let req: MessagesRequest = match serde_json::from_value(raw.clone()) {
+        Ok(r) => r,
+        Err(_) => return invalid_body_response(),
     };
 
     let Some(model) = req.model.clone() else {
@@ -464,7 +526,19 @@ pub async fn v1_messages_handler(
         req.reasoning.as_ref(),
         req.output_config.as_ref(),
     );
-    let candidates = match resolve_route_candidates(&model, MappingEndpoint::Messages, effort.as_deref()) {
+    let resolve_result = resolve_route_candidates(&model, MappingEndpoint::Messages, effort.as_deref());
+    let fingerprint = resolve_result
+        .as_ref()
+        .ok()
+        .and_then(|c| get_route_fingerprint(c, MappingEndpoint::Messages));
+    let cache_key = completion_key(&raw, fingerprint.as_deref());
+    if !cache_bypassed(&headers)
+        && let Some(entry) = lookup_completion(&cache_key)
+    {
+        tracing::info!("[Cache] HIT for Anthropic Messages: {cache_key}");
+        return messages_hit_response(&req, &entry);
+    }
+    let candidates = match resolve_result {
         Ok(c) => c,
         Err(err) => {
             return (
@@ -946,19 +1020,14 @@ async fn dispatch_codex_completions(
     }
 }
 
-pub async fn v1_chat_completions_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Result<Json<CompletionsRequest>, axum::extract::rejection::JsonRejection>,
-) -> Response {
-    let Ok(Json(req)) = body else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": { "message": "Invalid JSON request body", "type": "invalid_request_error" }
-            })),
-        )
-            .into_response();
+pub async fn v1_chat_completions_handler(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let raw: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return invalid_body_response(),
+    };
+    let req: CompletionsRequest = match serde_json::from_value(raw.clone()) {
+        Ok(r) => r,
+        Err(_) => return invalid_body_response(),
     };
 
     let Some(model) = req.model.clone() else {
@@ -979,7 +1048,19 @@ pub async fn v1_chat_completions_handler(
         req.reasoning.as_ref(),
         req.output_config.as_ref(),
     );
-    let candidates = match resolve_route_candidates(&model, MappingEndpoint::OpenAi, effort.as_deref()) {
+    let resolve_result = resolve_route_candidates(&model, MappingEndpoint::OpenAi, effort.as_deref());
+    let fingerprint = resolve_result
+        .as_ref()
+        .ok()
+        .and_then(|c| get_route_fingerprint(c, MappingEndpoint::OpenAi));
+    let cache_key = completion_key(&raw, fingerprint.as_deref());
+    if !cache_bypassed(&headers)
+        && let Some(entry) = lookup_completion(&cache_key)
+    {
+        tracing::info!("[Cache] HIT for OpenAI Chat completions: {cache_key}");
+        return completions_hit_response(&raw, &req, &entry);
+    }
+    let candidates = match resolve_result {
         Ok(c) => c,
         Err(err) => {
             return (
@@ -1145,6 +1226,168 @@ mod tests {
 
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_completions_hit_serves_cached_stream() {
+        use crate::model_mapping::{MappingEndpoint, get_route_fingerprint, resolve_route_candidates};
+        use crate::utils::completion_cache::{
+            CompletionEntry, CompletionUsage, completion_key, write_completion_cache,
+        };
+        let state = AppState::default();
+        let app = create_app(state);
+
+        let body = serde_json::json!({
+            "model": "gemini-3.8-flash-tiered",
+            "stream": true,
+            "messages": [{ "role": "user", "content": "cache-hit-probe-stream-1" }]
+        });
+        let candidates = resolve_route_candidates("gemini-3.8-flash-tiered", MappingEndpoint::OpenAi, None).unwrap();
+        let fingerprint = get_route_fingerprint(&candidates, MappingEndpoint::OpenAi);
+        let key = completion_key(&body, fingerprint.as_deref());
+        write_completion_cache(
+            &key,
+            CompletionEntry {
+                text: "cached-stream-reply".to_string(),
+                reasoning: None,
+                thought_signature: None,
+                finish_reason: Some("STOP".to_string()),
+                tool_calls: None,
+                usage: CompletionUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    reasoning_tokens: 0,
+                },
+                model: "gemini-3.8-flash-tiered".to_string(),
+                created: 0,
+            },
+        );
+
+        let req = Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get("x-cache").map(|v| v.to_str().unwrap()), Some("HIT"));
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let content: String = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .filter_map(|d| serde_json::from_str::<serde_json::Value>(d.trim()).ok())
+            .filter_map(|v| {
+                v.get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("content"))
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(content, "cached-stream-reply");
+        assert!(text.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_hit_serves_cached_json() {
+        use crate::model_mapping::{MappingEndpoint, get_route_fingerprint, resolve_route_candidates};
+        use crate::utils::completion_cache::{
+            CompletionEntry, CompletionUsage, completion_key, write_completion_cache,
+        };
+        let state = AppState::default();
+        let app = create_app(state);
+
+        let body = serde_json::json!({
+            "model": "gemini-3.8-flash-tiered",
+            "max_tokens": 50,
+            "messages": [{ "role": "user", "content": "cache-hit-probe-json-2" }]
+        });
+        let candidates = resolve_route_candidates("gemini-3.8-flash-tiered", MappingEndpoint::Messages, None).unwrap();
+        let fingerprint = get_route_fingerprint(&candidates, MappingEndpoint::Messages);
+        let key = completion_key(&body, fingerprint.as_deref());
+        write_completion_cache(
+            &key,
+            CompletionEntry {
+                text: "cached-json-reply".to_string(),
+                reasoning: Some("cached reason".to_string()),
+                thought_signature: Some("sig_cached".to_string()),
+                finish_reason: Some("STOP".to_string()),
+                tool_calls: None,
+                usage: CompletionUsage {
+                    input_tokens: 4,
+                    output_tokens: 3,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    reasoning_tokens: 0,
+                },
+                model: "gemini-3.8-flash-tiered".to_string(),
+                created: 0,
+            },
+        );
+
+        let req = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get("x-cache").map(|v| v.to_str().unwrap()), Some("HIT"));
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.get("stop_reason").and_then(|v| v.as_str()), Some("end_turn"));
+        let blocks = parsed.get("content").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            blocks[0].get("thinking").and_then(|v| v.as_str()),
+            Some("cached reason")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_key_hit_served_when_route_unknown() {
+        use crate::utils::completion_cache::{
+            CompletionEntry, CompletionUsage, completion_key, write_completion_cache,
+        };
+        let state = AppState::default();
+        let app = create_app(state);
+
+        let body = serde_json::json!({
+            "model": "unknown-nonexistent-model",
+            "messages": [{ "role": "user", "content": "cache-hit-probe-legacy-3" }]
+        });
+        let key = completion_key(&body, None);
+        write_completion_cache(
+            &key,
+            CompletionEntry {
+                text: "cached-legacy-reply".to_string(),
+                reasoning: None,
+                thought_signature: None,
+                finish_reason: Some("STOP".to_string()),
+                tool_calls: None,
+                usage: CompletionUsage::default(),
+                model: "unknown-nonexistent-model".to_string(),
+                created: 0,
+            },
+        );
+
+        let req = Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get("x-cache").map(|v| v.to_str().unwrap()), Some("HIT"));
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("cached-legacy-reply"));
     }
 
     #[tokio::test]

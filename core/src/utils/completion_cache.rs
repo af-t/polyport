@@ -197,6 +197,426 @@ pub fn lookup_completion(key: &str) -> Option<CompletionEntry> {
     COMPLETION_CACHE.lock().ok().and_then(|guard| guard.get_fresh(key))
 }
 
+fn usable_signature(sig: Option<&str>) -> Option<&str> {
+    sig.filter(|s| !s.is_empty() && *s != super::history_cache::DUMMY_SIGNATURE)
+}
+
+/// Split text into 8-character replay words, mirroring TS `match(/.{1,8}/g)`.
+#[must_use]
+pub fn split_words(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    chars.chunks(8).map(|c| c.iter().collect()).collect()
+}
+
+fn reasoning_details_block(format: &str, text: &str, signature: Option<&str>) -> Value {
+    let mut entry = serde_json::json!({
+        "type": "reasoning.text",
+        "id": Value::Null,
+        "text": text,
+        "format": format,
+        "index": 0
+    });
+    if let Some(sig) = usable_signature(signature) {
+        entry["signature"] = Value::String(sig.to_string());
+    }
+    entry
+}
+
+/// `OpenAI` usage object mirroring TS `toOpenAIUsage`.
+#[must_use]
+pub fn openai_usage_value(usage: &CompletionUsage) -> Value {
+    let prompt_tokens = usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
+    let mut prompt_details = serde_json::json!({
+        "cached_tokens": usage.cache_read_tokens,
+        "audio_tokens": 0
+    });
+    if usage.cache_write_tokens > 0 {
+        prompt_details["cache_write_tokens"] = Value::from(usage.cache_write_tokens);
+    }
+    serde_json::json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": usage.output_tokens,
+        "total_tokens": prompt_tokens + usage.output_tokens,
+        "prompt_tokens_details": prompt_details,
+        "completion_tokens_details": {
+            "reasoning_tokens": usage.reasoning_tokens,
+            "audio_tokens": 0,
+            "accepted_prediction_tokens": 0,
+            "rejected_prediction_tokens": 0
+        }
+    })
+}
+
+/// `Anthropic` usage object mirroring TS `toAnthropicUsage`.
+#[must_use]
+pub fn anthropic_usage_value(usage: &CompletionUsage) -> Value {
+    serde_json::json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_creation_input_tokens": usage.cache_write_tokens,
+        "cache_read_input_tokens": usage.cache_read_tokens
+    })
+}
+
+/// `Anthropic` streaming delta usage mirroring TS `toAnthropicDeltaUsage`.
+#[must_use]
+pub fn anthropic_delta_usage_value(usage: &CompletionUsage) -> Value {
+    serde_json::json!({
+        "input_tokens": usage.input_tokens,
+        "cache_creation_input_tokens": usage.cache_write_tokens,
+        "cache_read_input_tokens": usage.cache_read_tokens,
+        "output_tokens": usage.output_tokens
+    })
+}
+
+/// Map a stored `Gemini` finish reason to `OpenAI`, mirroring TS `mapGeminiToOpenAIFinish`.
+#[must_use]
+pub fn map_gemini_to_openai_finish(reason: Option<&str>, has_tool_calls: bool) -> &'static str {
+    if has_tool_calls {
+        return "tool_calls";
+    }
+    match reason {
+        Some("MAX_TOKENS") => "length",
+        Some("SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY" | "LANGUAGE") => {
+            "content_filter"
+        }
+        _ => "stop",
+    }
+}
+
+/// Map a stored `Gemini` finish reason to `Anthropic`, mirroring TS `mapGeminiToAnthropicStop`.
+#[must_use]
+pub fn map_gemini_to_anthropic_stop(reason: Option<&str>, has_tool_calls: bool) -> &'static str {
+    if has_tool_calls {
+        return "tool_use";
+    }
+    match reason {
+        Some("MAX_TOKENS") => "max_tokens",
+        Some("SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY" | "LANGUAGE") => {
+            "refusal"
+        }
+        _ => "end_turn",
+    }
+}
+
+fn openai_chunk(id: &str, created: u64, model: &str, delta: &Value, finish_reason: &Value) -> String {
+    let chunk = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }]
+    });
+    format!("data: {chunk}\n\n")
+}
+
+/// SSE event stream replaying a cached entry as `OpenAI` chunks, mirroring TS completions HIT.
+#[must_use]
+pub fn replay_completions_stream(
+    entry: &CompletionEntry,
+    reasoning_format: &str,
+    reasoning_excluded: bool,
+    want_usage: bool,
+) -> Vec<String> {
+    let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    let mut events = Vec::new();
+    let has_tools = entry.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
+    if let Some(reasoning) = entry.reasoning.as_deref()
+        && !reasoning.is_empty()
+        && !reasoning_excluded
+    {
+        for word in split_words(reasoning) {
+            let delta = serde_json::json!({
+                "reasoning": word,
+                "reasoning_content": word,
+                "reasoning_details": [reasoning_details_block(reasoning_format, &word, None)]
+            });
+            events.push(openai_chunk(&id, entry.created, &entry.model, &delta, &Value::Null));
+        }
+    }
+    if let Some(sig) = usable_signature(entry.thought_signature.as_deref())
+        && !reasoning_excluded
+    {
+        let delta = serde_json::json!({
+            "reasoning_details": [reasoning_details_block(reasoning_format, "", Some(sig))]
+        });
+        events.push(openai_chunk(&id, entry.created, &entry.model, &delta, &Value::Null));
+    }
+    if !entry.text.is_empty() {
+        for word in split_words(&entry.text) {
+            let delta = serde_json::json!({ "content": word });
+            events.push(openai_chunk(&id, entry.created, &entry.model, &delta, &Value::Null));
+        }
+    }
+    if let Some(tool_calls) = entry.tool_calls.as_deref() {
+        for (index, tc) in tool_calls.iter().enumerate() {
+            let delta = serde_json::json!({
+                "tool_calls": [{
+                    "index": index,
+                    "id": tc.id,
+                    "type": "function",
+                    "function": { "name": tc.name, "arguments": tc.arguments }
+                }]
+            });
+            events.push(openai_chunk(&id, entry.created, &entry.model, &delta, &Value::Null));
+        }
+    }
+    let finish = Value::String(map_gemini_to_openai_finish(entry.finish_reason.as_deref(), has_tools).to_string());
+    let empty = serde_json::json!({});
+    events.push(openai_chunk(&id, entry.created, &entry.model, &empty, &finish));
+    if want_usage {
+        let chunk = serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": entry.created,
+            "model": entry.model,
+            "choices": [],
+            "usage": openai_usage_value(&entry.usage)
+        });
+        events.push(format!("data: {chunk}\n\n"));
+    }
+    events.push("data: [DONE]\n\n".to_string());
+    events
+}
+
+/// Non-streaming `OpenAI` completion replaying a cached entry, mirroring TS completions HIT.
+#[must_use]
+pub fn replay_completions_json(entry: &CompletionEntry, reasoning_format: &str, reasoning_excluded: bool) -> Value {
+    let has_tools = entry.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": if entry.text.is_empty() { Value::Null } else { Value::String(entry.text.clone()) }
+    });
+    if let Some(reasoning) = entry.reasoning.as_deref()
+        && !reasoning.is_empty()
+        && !reasoning_excluded
+    {
+        message["reasoning"] = Value::String(reasoning.to_string());
+        message["reasoning_content"] = Value::String(reasoning.to_string());
+    }
+    let sig = usable_signature(entry.thought_signature.as_deref());
+    if (entry.reasoning.as_deref().is_some_and(|r| !r.is_empty()) || sig.is_some()) && !reasoning_excluded {
+        message["reasoning_details"] = Value::Array(vec![reasoning_details_block(
+            reasoning_format,
+            entry.reasoning.as_deref().unwrap_or(""),
+            sig,
+        )]);
+    }
+    if let Some(tool_calls) = entry.tool_calls.as_deref() {
+        message["tool_calls"] = Value::Array(
+            tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": { "name": tc.name, "arguments": tc.arguments }
+                    })
+                })
+                .collect(),
+        );
+    }
+    serde_json::json!({
+        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+        "object": "chat.completion",
+        "created": entry.created,
+        "model": entry.model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": map_gemini_to_openai_finish(entry.finish_reason.as_deref(), has_tools)
+        }],
+        "usage": openai_usage_value(&entry.usage)
+    })
+}
+
+fn thinking_block_events(entry: &CompletionEntry, index: usize, reasoning: &str) -> Vec<String> {
+    let mut events = vec![format!(
+        "event: content_block_start\ndata: {}\n\n",
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": { "type": "thinking", "thinking": "" }
+        })
+    )];
+    for word in split_words(reasoning) {
+        events.push(format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": { "type": "thinking_delta", "thinking": word }
+            })
+        ));
+    }
+    let sig = entry
+        .thought_signature
+        .clone()
+        .unwrap_or_else(|| super::history_cache::DUMMY_SIGNATURE.to_string());
+    events.push(format!(
+        "event: content_block_delta\ndata: {}\n\n",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": { "type": "signature_delta", "signature": sig }
+        })
+    ));
+    events.push(format!(
+        "event: content_block_stop\ndata: {}\n\n",
+        serde_json::json!({ "type": "content_block_stop", "index": index })
+    ));
+    events
+}
+
+fn text_block_events(text: &str, index: usize) -> Vec<String> {
+    let mut events = vec![format!(
+        "event: content_block_start\ndata: {}\n\n",
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": { "type": "text", "text": "" }
+        })
+    )];
+    for word in split_words(text) {
+        events.push(format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": { "type": "text_delta", "text": word }
+            })
+        ));
+    }
+    events.push(format!(
+        "event: content_block_stop\ndata: {}\n\n",
+        serde_json::json!({ "type": "content_block_stop", "index": index })
+    ));
+    events
+}
+
+fn tool_block_events(tc: &CompletionToolCall, index: usize) -> Vec<String> {
+    vec![
+        format!(
+            "event: content_block_start\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": { "type": "tool_use", "id": tc.id, "name": tc.name, "input": {} }
+            })
+        ),
+        format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": { "type": "input_json_delta", "partial_json": tc.arguments }
+            })
+        ),
+        format!(
+            "event: content_block_stop\ndata: {}\n\n",
+            serde_json::json!({ "type": "content_block_stop", "index": index })
+        ),
+    ]
+}
+
+/// SSE event stream replaying a cached entry as `Anthropic` events, mirroring TS messages HIT.
+#[must_use]
+pub fn replay_messages_stream(entry: &CompletionEntry, reasoning_excluded: bool) -> Vec<String> {
+    let msg_id = format!("msg_{}", uuid::Uuid::new_v4());
+    let mut events = Vec::new();
+    let has_tools = entry.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
+    let mut start_usage = anthropic_usage_value(&entry.usage);
+    start_usage["output_tokens"] = Value::from(0);
+    events.push(format!(
+        "event: message_start\ndata: {}\n\n",
+        serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": entry.model,
+                "usage": start_usage
+            }
+        })
+    ));
+    let mut block_index = 0;
+    if let Some(reasoning) = entry.reasoning.as_deref()
+        && !reasoning.is_empty()
+        && !reasoning_excluded
+    {
+        let thinking_index = block_index;
+        block_index += 1;
+        events.extend(thinking_block_events(entry, thinking_index, reasoning));
+    }
+    if !entry.text.is_empty() {
+        let text_index = block_index;
+        block_index += 1;
+        events.extend(text_block_events(&entry.text, text_index));
+    }
+    if let Some(tool_calls) = entry.tool_calls.as_deref() {
+        for tc in tool_calls {
+            let tool_index = block_index;
+            block_index += 1;
+            events.extend(tool_block_events(tc, tool_index));
+        }
+    }
+    events.push(format!(
+        "event: message_delta\ndata: {}\n\n",
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": map_gemini_to_anthropic_stop(entry.finish_reason.as_deref(), has_tools),
+                "stop_sequence": Value::Null
+            },
+            "usage": anthropic_delta_usage_value(&entry.usage)
+        })
+    ));
+    events.push("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string());
+    events
+}
+
+/// Non-streaming `Anthropic` message replaying a cached entry, mirroring TS messages HIT.
+#[must_use]
+pub fn replay_messages_json(entry: &CompletionEntry, reasoning_excluded: bool) -> Value {
+    let has_tools = entry.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
+    let mut blocks = Vec::new();
+    if let Some(reasoning) = entry.reasoning.as_deref()
+        && !reasoning.is_empty()
+        && !reasoning_excluded
+    {
+        blocks.push(serde_json::json!({
+            "type": "thinking",
+            "thinking": reasoning,
+            "signature": entry.thought_signature.clone()
+                .unwrap_or_else(|| super::history_cache::DUMMY_SIGNATURE.to_string())
+        }));
+    }
+    if !entry.text.is_empty() {
+        blocks.push(serde_json::json!({ "type": "text", "text": entry.text }));
+    }
+    if let Some(tool_calls) = entry.tool_calls.as_deref() {
+        for tc in tool_calls {
+            let input: Value = serde_json::from_str(&tc.arguments).unwrap_or(Value::Null);
+            blocks.push(serde_json::json!({ "type": "tool_use", "id": tc.id, "name": tc.name, "input": input }));
+        }
+    }
+    serde_json::json!({
+        "id": format!("msg_{}", uuid::Uuid::new_v4()),
+        "type": "message",
+        "role": "assistant",
+        "content": blocks,
+        "model": entry.model,
+        "stop_reason": map_gemini_to_anthropic_stop(entry.finish_reason.as_deref(), has_tools),
+        "stop_sequence": Value::Null,
+        "usage": anthropic_usage_value(&entry.usage)
+    })
+}
+
 fn deterministic_stringify(value: &Value) -> String {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.to_string(),
@@ -477,6 +897,247 @@ mod tests {
             Some(10)
         );
         assert!(value.get("thought_signature").is_none());
+    }
+
+    #[test]
+    fn test_finish_mappers_match_ts() {
+        use super::{map_gemini_to_anthropic_stop, map_gemini_to_openai_finish};
+        assert_eq!(map_gemini_to_openai_finish(Some("STOP"), false), "stop");
+        assert_eq!(map_gemini_to_openai_finish(None, false), "stop");
+        assert_eq!(map_gemini_to_openai_finish(Some("MAX_TOKENS"), false), "length");
+        assert_eq!(map_gemini_to_openai_finish(Some("SAFETY"), false), "content_filter");
+        assert_eq!(map_gemini_to_openai_finish(Some("RECITATION"), false), "content_filter");
+        assert_eq!(map_gemini_to_openai_finish(Some("STOP"), true), "tool_calls");
+        assert_eq!(map_gemini_to_openai_finish(Some("MAX_TOKENS"), true), "tool_calls");
+        assert_eq!(map_gemini_to_anthropic_stop(Some("STOP"), false), "end_turn");
+        assert_eq!(map_gemini_to_anthropic_stop(None, false), "end_turn");
+        assert_eq!(map_gemini_to_anthropic_stop(Some("MAX_TOKENS"), false), "max_tokens");
+        assert_eq!(map_gemini_to_anthropic_stop(Some("SAFETY"), false), "refusal");
+        assert_eq!(map_gemini_to_anthropic_stop(Some("STOP"), true), "tool_use");
+    }
+
+    fn rich_entry() -> CompletionEntry {
+        CompletionEntry {
+            text: "hello world, this is a long reply".to_string(),
+            reasoning: Some("thinking through the answer".to_string()),
+            thought_signature: Some("sig_abc".to_string()),
+            finish_reason: Some("STOP".to_string()),
+            tool_calls: Some(vec![super::CompletionToolCall {
+                id: "call_1".to_string(),
+                name: "noop".to_string(),
+                arguments: "{\"a\":1}".to_string(),
+            }]),
+            usage: CompletionUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: 2,
+                cache_write_tokens: 0,
+                reasoning_tokens: 4,
+            },
+            model: "m".to_string(),
+            created: 1_700_000_001,
+        }
+    }
+
+    fn parse_sse_data(event: &str) -> serde_json::Value {
+        try_parse_sse_data(event).unwrap()
+    }
+
+    fn try_parse_sse_data(event: &str) -> Option<serde_json::Value> {
+        let data_line = event.lines().find(|l| l.starts_with("data:"))?;
+        serde_json::from_str(data_line.trim_start_matches("data:").trim()).ok()
+    }
+
+    #[test]
+    fn test_replay_completions_stream_shape() {
+        use super::replay_completions_stream;
+        let events = replay_completions_stream(&rich_entry(), "google-gemini-v1", false, true);
+        assert_eq!(events.last().unwrap(), "data: [DONE]\n\n");
+        let usage = parse_sse_data(&events[events.len() - 2]);
+        assert_eq!(usage.get("choices").unwrap().as_array().unwrap().len(), 0);
+        assert_eq!(
+            usage
+                .get("usage")
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(Value::as_u64),
+            Some(12)
+        );
+        assert_eq!(
+            usage
+                .get("usage")
+                .and_then(|u| u.get("completion_tokens_details"))
+                .and_then(|d| d.get("reasoning_tokens"))
+                .and_then(Value::as_u64),
+            Some(4)
+        );
+        let final_chunk = parse_sse_data(&events[events.len() - 3]);
+        assert_eq!(
+            final_chunk
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("finish_reason")),
+            Some(&serde_json::Value::String("tool_calls".to_string()))
+        );
+        let first = parse_sse_data(&events[0]);
+        let delta = first
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("delta"))
+            .unwrap();
+        assert_eq!(delta.get("reasoning").and_then(Value::as_str), Some("thinking"));
+        assert_eq!(
+            delta
+                .get("reasoning_details")
+                .and_then(|d| d.get(0))
+                .and_then(|d| d.get("format"))
+                .and_then(Value::as_str),
+            Some("google-gemini-v1")
+        );
+        let sig_chunk = events
+            .iter()
+            .map(|e| parse_sse_data(e))
+            .find(|v| {
+                v.get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("reasoning_details"))
+                    .is_some_and(|d| {
+                        d.get(0).and_then(|b| b.get("signature")).and_then(Value::as_str) == Some("sig_abc")
+                    })
+            })
+            .expect("signature chunk must carry the stored signature");
+        let _ = sig_chunk;
+        let content: String = events
+            .iter()
+            .filter_map(|e| try_parse_sse_data(e))
+            .filter_map(|v| {
+                v.get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("content"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(content, "hello world, this is a long reply");
+    }
+
+    #[test]
+    fn test_replay_completions_json_shape() {
+        use super::replay_completions_json;
+        let body = replay_completions_json(&rich_entry(), "google-gemini-v1", false);
+        assert_eq!(body.get("object").and_then(Value::as_str), Some("chat.completion"));
+        let choice = body.get("choices").and_then(|c| c.get(0)).unwrap();
+        assert_eq!(choice.get("finish_reason").and_then(Value::as_str), Some("tool_calls"));
+        let message = choice.get("message").unwrap();
+        assert_eq!(
+            message.get("reasoning").and_then(Value::as_str),
+            Some("thinking through the answer")
+        );
+        assert_eq!(
+            message
+                .get("reasoning_details")
+                .and_then(|d| d.get(0))
+                .and_then(|d| d.get("signature"))
+                .and_then(Value::as_str),
+            Some("sig_abc")
+        );
+        let tool = message.get("tool_calls").and_then(|t| t.get(0)).unwrap();
+        assert_eq!(tool.get("id").and_then(Value::as_str), Some("call_1"));
+        assert_eq!(
+            body.get("usage")
+                .and_then(|u| u.get("total_tokens"))
+                .and_then(Value::as_u64),
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn test_replay_messages_stream_shape() {
+        use super::replay_messages_stream;
+        let events = replay_messages_stream(&rich_entry(), false);
+        assert!(events[0].starts_with("event: message_start\n"));
+        let start = parse_sse_data(&events[0]);
+        assert_eq!(
+            start
+                .get("message")
+                .and_then(|m| m.get("usage"))
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert!(events.iter().any(|e| e.contains("thinking_delta")));
+        let sig_delta = events
+            .iter()
+            .map(|e| parse_sse_data(e))
+            .find(|v| v.get("delta").and_then(|d| d.get("type")).and_then(Value::as_str) == Some("signature_delta"))
+            .unwrap();
+        assert_eq!(
+            sig_delta
+                .get("delta")
+                .and_then(|d| d.get("signature"))
+                .and_then(Value::as_str),
+            Some("sig_abc")
+        );
+        assert!(events.iter().any(|e| e.contains("input_json_delta")));
+        assert!(events.iter().any(|e| e.contains("call_1")));
+        let delta = events
+            .iter()
+            .find(|e| e.starts_with("event: message_delta\n"))
+            .map(|e| parse_sse_data(e))
+            .unwrap();
+        assert_eq!(
+            delta
+                .get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(Value::as_str),
+            Some("tool_use")
+        );
+        assert!(events.last().unwrap().starts_with("event: message_stop\n"));
+    }
+
+    #[test]
+    fn test_replay_messages_json_shape() {
+        use super::replay_messages_json;
+        let body = replay_messages_json(&rich_entry(), false);
+        assert_eq!(body.get("stop_reason").and_then(Value::as_str), Some("tool_use"));
+        let blocks = body.get("content").and_then(Value::as_array).unwrap();
+        assert_eq!(blocks[0].get("type").and_then(Value::as_str), Some("thinking"));
+        assert_eq!(blocks[0].get("signature").and_then(Value::as_str), Some("sig_abc"));
+        assert_eq!(blocks[1].get("type").and_then(Value::as_str), Some("text"));
+        assert_eq!(blocks[2].get("type").and_then(Value::as_str), Some("tool_use"));
+        assert_eq!(
+            blocks[2].get("input").and_then(|i| i.get("a")).and_then(Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_replay_respects_reasoning_excluded() {
+        use super::{replay_completions_json, replay_completions_stream, replay_messages_json, replay_messages_stream};
+        assert!(
+            replay_completions_stream(&rich_entry(), "google-gemini-v1", true, false)
+                .iter()
+                .all(|e| !e.contains("reasoning"))
+        );
+        let json = replay_completions_json(&rich_entry(), "google-gemini-v1", true);
+        let message = json
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .unwrap();
+        assert!(message.get("reasoning").is_none());
+        assert!(message.get("reasoning_details").is_none());
+        assert!(
+            replay_messages_stream(&rich_entry(), true)
+                .iter()
+                .all(|e| !e.contains("thinking"))
+        );
+        let msg = replay_messages_json(&rich_entry(), true);
+        assert!(msg.get("content").and_then(Value::as_array).is_some_and(|b| {
+            b.iter()
+                .all(|x| x.get("type").and_then(Value::as_str) != Some("thinking"))
+        }));
     }
 
     #[test]

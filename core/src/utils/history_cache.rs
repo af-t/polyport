@@ -461,7 +461,7 @@ fn sha256_hex_bytes(digest: &[u8]) -> String {
     out
 }
 
-fn sha256_hex(input: &str) -> String {
+pub(crate) fn sha256_hex(input: &str) -> String {
     sha256_hex_bytes(&Sha256::digest(input.as_bytes()))
 }
 
