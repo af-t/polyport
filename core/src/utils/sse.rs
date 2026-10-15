@@ -33,7 +33,9 @@ pub struct AnthropicStreamState {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub thought_signature: String,
+    pub reasoning: String,
     pub tool_ids: Vec<String>,
+    pub history_key: String,
 }
 
 impl AnthropicStreamState {
@@ -49,7 +51,9 @@ impl AnthropicStreamState {
             input_tokens: 0,
             output_tokens: 0,
             thought_signature: String::new(),
+            reasoning: String::new(),
             tool_ids: Vec::new(),
+            history_key: String::new(),
         }
     }
 }
@@ -60,14 +64,26 @@ fn part_signature(part: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-fn note_part_signature(state_sig: &mut String, tool_ids: &[String], part: &Value) {
+fn note_part_signature(
+    state_sig: &mut String,
+    reasoning: &mut String,
+    tool_ids: &[String],
+    history_key: &str,
+    part: &Value,
+) {
+    if part.get("thought").and_then(Value::as_bool) == Some(true)
+        && let Some(text) = part.get("text").and_then(Value::as_str)
+    {
+        reasoning.push_str(text);
+    }
     if let Some(sig) = part_signature(part)
         && !sig.is_empty()
     {
         *state_sig = sig.to_string();
         for id in tool_ids {
-            crate::utils::history_cache::record_tool_signature(id, sig, "");
+            crate::utils::history_cache::record_tool_signature(id, sig, reasoning);
         }
+        crate::utils::history_cache::record_history(history_key, sig, reasoning);
     }
 }
 
@@ -103,7 +119,13 @@ fn gemini_part_to_anthropic(part: &Value, state: &mut AnthropicStreamState) -> V
         events.push(format!("event: content_block_delta\ndata: {delta}\n\n"));
     }
 
-    note_part_signature(&mut state.thought_signature, &state.tool_ids, part);
+    note_part_signature(
+        &mut state.thought_signature,
+        &mut state.reasoning,
+        &state.tool_ids,
+        &state.history_key,
+        part,
+    );
     if let Some(fc) = part.get("functionCall") {
         let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
         let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
@@ -226,7 +248,10 @@ pub struct OpenAiStreamState {
     pub finished: bool,
     pub created: u64,
     pub thought_signature: String,
+    pub reasoning: String,
     pub tool_ids: Vec<String>,
+    pub history_key: String,
+    pub reasoning_excluded: bool,
 }
 
 impl OpenAiStreamState {
@@ -242,9 +267,62 @@ impl OpenAiStreamState {
             finished: false,
             created,
             thought_signature: String::new(),
+            reasoning: String::new(),
             tool_ids: Vec::new(),
+            history_key: String::new(),
+            reasoning_excluded: false,
         }
     }
+}
+
+#[must_use]
+pub fn reasoning_format_for(model: &str) -> &'static str {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("gpt-5") || lower.contains("codex") {
+        return "openai-codex-v1";
+    }
+    if lower.contains("claude")
+        || lower.contains("opus")
+        || lower.contains("sonnet")
+        || lower.contains("fable")
+        || lower.contains("haiku")
+    {
+        return "anthropic-claude-v1";
+    }
+    "google-gemini-v1"
+}
+
+#[must_use]
+pub fn reasoning_details_chunk(
+    completion_id: &str,
+    created: u64,
+    model: &str,
+    text: &str,
+    signature: &str,
+) -> Option<serde_json::Value> {
+    if signature.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "reasoning_details": [{
+                    "type": "reasoning.text",
+                    "id": serde_json::Value::Null,
+                    "text": text,
+                    "format": reasoning_format_for(model),
+                    "index": 0,
+                    "signature": signature
+                }]
+            },
+            "finish_reason": serde_json::Value::Null
+        }]
+    }))
 }
 
 #[must_use]
@@ -283,7 +361,13 @@ pub fn gemini_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec
 
     if let Some(parts_arr) = parts {
         for part in parts_arr {
-            note_part_signature(&mut state.thought_signature, &state.tool_ids, part);
+            note_part_signature(
+                &mut state.thought_signature,
+                &mut state.reasoning,
+                &state.tool_ids,
+                &state.history_key,
+                part,
+            );
             if let Some(text) = part.get("text").and_then(Value::as_str) {
                 let text_chunk = serde_json::json!({
                     "id": &state.completion_id,
@@ -335,22 +419,33 @@ pub fn gemini_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec
     let finish_reason = candidate.and_then(|c| c.get("finishReason")).and_then(Value::as_str);
     if (finish_reason.is_some() || chunk.get("response").is_none()) && !state.finished {
         state.finished = true;
-        let final_chunk = serde_json::json!({
-            "id": &state.completion_id,
-            "object": "chat.completion.chunk",
-            "created": state.created,
-            "model": &state.model,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop"
-            }]
-        });
-        events.push(format!("data: {final_chunk}\n\n"));
-        events.push("data: [DONE]\n\n".to_string());
+        finish_openai_gemini_turn(state, &mut events);
     }
 
     events
+}
+
+fn finish_openai_gemini_turn(state: &OpenAiStreamState, events: &mut Vec<String>) {
+    if !state.reasoning_excluded {
+        let token = crate::utils::history_cache::mint_reasoning_token(&state.thought_signature, &state.reasoning);
+        if let Some(sig_chunk) = reasoning_details_chunk(&state.completion_id, state.created, &state.model, "", &token)
+        {
+            events.push(format!("data: {sig_chunk}\n\n"));
+        }
+    }
+    let final_chunk = serde_json::json!({
+        "id": &state.completion_id,
+        "object": "chat.completion.chunk",
+        "created": state.created,
+        "model": &state.model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }]
+    });
+    events.push(format!("data: {final_chunk}\n\n"));
+    events.push("data: [DONE]\n\n".to_string());
 }
 
 #[must_use]
@@ -422,6 +517,7 @@ pub struct GeminiFunctionCall {
 #[derive(Debug, Clone)]
 pub struct CollectedGemini {
     pub text: String,
+    pub reasoning: String,
     pub function_calls: Vec<GeminiFunctionCall>,
     pub thought_signature: Option<String>,
     pub finish_reason: Option<String>,
@@ -432,6 +528,7 @@ pub struct CollectedGemini {
 #[must_use]
 pub fn collect_gemini_response(chunks: &[Value]) -> CollectedGemini {
     let mut full_text = String::new();
+    let mut reasoning = String::new();
     let mut function_calls = Vec::new();
     let mut thought_signature: Option<String> = None;
     let mut finish_reason = None;
@@ -466,7 +563,11 @@ pub fn collect_gemini_response(chunks: &[Value]) -> CollectedGemini {
             {
                 for part in parts {
                     if let Some(t) = part.get("text").and_then(Value::as_str) {
-                        full_text.push_str(t);
+                        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                            reasoning.push_str(t);
+                        } else {
+                            full_text.push_str(t);
+                        }
                     }
                     if let Some(sig) = part_signature(part)
                         && !sig.is_empty()
@@ -489,6 +590,7 @@ pub fn collect_gemini_response(chunks: &[Value]) -> CollectedGemini {
 
     CollectedGemini {
         text: full_text,
+        reasoning,
         function_calls,
         thought_signature,
         finish_reason,

@@ -80,6 +80,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_models_list_returns_openai_list_shape() {
+        let state = AppState::default();
+        let app = create_app(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/models")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val.get("object").and_then(serde_json::Value::as_str), Some("list"));
+        let data = val.get("data").and_then(serde_json::Value::as_array).unwrap();
+        assert_ne!(data.len(), 0);
+        let first = &data[0];
+        assert_eq!(first.get("object").and_then(serde_json::Value::as_str), Some("model"));
+        assert!(first.get("id").and_then(serde_json::Value::as_str).is_some());
+        assert!(first.get("owned_by").and_then(serde_json::Value::as_str).is_some());
+    }
+
+    #[tokio::test]
     async fn test_unknown_route_returns_404() {
         let state = AppState::default();
         let app = create_app(state);

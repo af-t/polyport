@@ -1,19 +1,56 @@
 use axum::Json;
 use axum::extract::Path;
-use axum::http::{StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::models::{get_models_catalog, models_catalog_json};
+use crate::models::get_models_catalog;
 use crate::services::credentials::{get_claude_accounts, get_codex_accounts};
 
+fn model_list_entry(entry: &crate::models::ModelDescriptor) -> Value {
+    let mut obj = json!({
+        "id": entry.id,
+        "object": "model",
+        "created": created_ts(),
+        "owned_by": owned_by(&entry.provider),
+        "name": entry.name,
+        "featured": entry.featured,
+        "thinking": entry.thinking,
+        "effort": entry.effort,
+    });
+    if let Some(modalities) = &entry.modalities {
+        obj["modalities"] = json!({"input": modalities.input, "output": modalities.output});
+    }
+    if let Some(context_window) = entry.context_window {
+        obj["context_window"] = json!(context_window);
+    }
+    if let Some(max_output) = entry.max_output {
+        obj["max_output"] = json!(max_output);
+    }
+    obj
+}
+
+fn model_list_visible(entry: &crate::models::ModelDescriptor) -> bool {
+    if entry.provider == "anthropic" && get_claude_accounts().is_empty() {
+        return false;
+    }
+    if entry.provider == "codex" && get_codex_accounts().is_empty() {
+        return false;
+    }
+    true
+}
+
 pub async fn models_handler() -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(axum::body::Body::from(models_catalog_json()))
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
+    let Ok(catalog) = get_models_catalog() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+    };
+    let data: Vec<Value> = catalog
+        .iter()
+        .filter(|m| model_list_visible(m))
+        .map(model_list_entry)
+        .collect();
+    (StatusCode::OK, Json(json!({ "object": "list", "data": data }))).into_response()
 }
 
 fn owned_by(provider: &str) -> &str {

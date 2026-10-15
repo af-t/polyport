@@ -19,7 +19,8 @@ use crate::services::anthropic::{
 use crate::services::codex::{CallCodexParams, CodexStreamResult, call_codex_stream};
 use crate::services::gemini::{CallGeminiParams, GeminiStreamResult, build_generation_config, call_gemini_stream};
 use crate::types::{ModelClass, Provider};
-use crate::utils::history_cache::record_tool_signature;
+use crate::utils::history_cache::{mint_reasoning_token, record_history, record_tool_signature};
+use crate::utils::sse::reasoning_format_for;
 use crate::utils::sse::{
     AnthropicStreamState, OpenAiStreamState, anthropic_to_openai_sse, codex_to_anthropic_sse, codex_to_openai_sse,
     collect_codex_response, collect_gemini_response, gemini_to_anthropic_sse, gemini_to_openai_sse,
@@ -34,6 +35,12 @@ pub struct MessagesRequest {
     pub stream: Option<bool>,
     pub thinking: Option<Value>,
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<Value>,
     pub tools: Option<Vec<Value>>,
     pub tool_choice: Option<Value>,
 }
@@ -44,10 +51,48 @@ pub struct CompletionsRequest {
     pub messages: Option<Vec<Value>>,
     pub stream: Option<bool>,
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<Value>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
     pub stop: Option<Value>,
     pub tools: Option<Vec<Value>>,
+}
+
+fn reasoning_excluded(reasoning: Option<&Value>) -> bool {
+    reasoning
+        .and_then(|r| r.get("exclude"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn gemini_history_key(model: Option<&str>, messages: &Value, system: &Value, tools: &Value) -> String {
+    crate::utils::history_cache::history_key(model.unwrap_or(""), messages, system, tools)
+}
+
+fn requested_effort(
+    effort: Option<&str>,
+    reasoning_effort: Option<&str>,
+    reasoning: Option<&Value>,
+    output_config: Option<&Value>,
+) -> Option<String> {
+    if let Some(e) = effort {
+        return Some(e.to_string());
+    }
+    if let Some(e) = reasoning_effort {
+        return Some(e.to_string());
+    }
+    if let Some(e) = reasoning.and_then(|r| r.get("effort")).and_then(Value::as_str) {
+        return Some(e.to_string());
+    }
+    output_config
+        .and_then(|o| o.get("effort"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn attempt_error_to_response(err: &AttemptError) -> Response {
@@ -103,8 +148,9 @@ where
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
 }
 
-fn handle_gemini_messages_stream(stream_res: GeminiStreamResult, model: &str) -> Response {
+fn handle_gemini_messages_stream(stream_res: GeminiStreamResult, model: &str, history_key: &str) -> Response {
     let mut sse_state = AnthropicStreamState::new(&format!("msg_{}", uuid::Uuid::new_v4()), model);
+    sse_state.history_key = history_key.to_string();
     stream_sse_transformed(stream_res.response.bytes_stream(), move |line| {
         if let Some(parsed) = parse_gemini_sse_line(line) {
             gemini_to_anthropic_sse(&parsed, &mut sse_state)
@@ -114,10 +160,13 @@ fn handle_gemini_messages_stream(stream_res: GeminiStreamResult, model: &str) ->
     })
 }
 
-async fn handle_gemini_messages_buffered(stream_res: GeminiStreamResult, model: &str) -> Response {
+async fn handle_gemini_messages_buffered(stream_res: GeminiStreamResult, model: &str, history_key: &str) -> Response {
     let full_body = stream_res.response.text().await.unwrap_or_default();
     let chunks: Vec<Value> = full_body.lines().filter_map(parse_gemini_sse_line).collect();
     let res = collect_gemini_response(&chunks);
+    if let Some(sig) = res.thought_signature.as_deref() {
+        record_history(history_key, sig, &res.reasoning);
+    }
 
     let mut content = Vec::new();
     if !res.text.is_empty() {
@@ -166,7 +215,14 @@ async fn dispatch_gemini_messages(
     preferred_account_id: Option<String>,
     lookup_keys: &[String],
 ) -> Response {
-    let is_thinking_requested = req.thinking.is_some() || req.effort.is_some();
+    let is_thinking_requested = req.thinking.is_some()
+        || requested_effort(
+            req.effort.as_deref(),
+            req.reasoning_effort.as_deref(),
+            req.reasoning.as_ref(),
+            req.output_config.as_ref(),
+        )
+        .is_some();
     let system_str = match &req.system {
         Some(Value::String(s)) => Some(s.as_str()),
         _ => None,
@@ -174,19 +230,24 @@ async fn dispatch_gemini_messages(
     let raw_val = serde_json::to_value(req).unwrap_or_default();
     let messages_val = serde_json::to_value(&req.messages).unwrap_or_default();
 
-    let (system_instruction, contents) = match map_messages_to_gemini(&messages_val, system_str, is_thinking_requested)
-    {
-        Ok(res) => res,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": { "message": err.to_string(), "type": "invalid_request_error" }
-                })),
-            )
-                .into_response();
-        }
+    let history_ctx = crate::utils::history_cache::HistoryContext {
+        model: req.model.clone().unwrap_or_default(),
+        system: req.system.clone().unwrap_or(Value::Null),
+        tools: serde_json::to_value(&req.tools).unwrap_or(Value::Null),
     };
+    let (system_instruction, contents) =
+        match map_messages_to_gemini(&messages_val, system_str, is_thinking_requested, Some(&history_ctx)) {
+            Ok(res) => res,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": { "message": err.to_string(), "type": "invalid_request_error" }
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     let generation_config = build_generation_config(&raw_val, &route.upstream_model, is_thinking_requested);
 
@@ -205,6 +266,12 @@ async fn dispatch_gemini_messages(
     };
 
     let model_name = req.model.as_deref().unwrap_or(&route.upstream_model);
+    let history_key = gemini_history_key(
+        req.model.as_deref(),
+        &messages_val,
+        &req.system.clone().unwrap_or(Value::Null),
+        &serde_json::to_value(&req.tools).unwrap_or(Value::Null),
+    );
     match call_gemini_stream(&params, &state.pool, &state.http_client).await {
         Ok(stream_res) => {
             {
@@ -212,9 +279,9 @@ async fn dispatch_gemini_messages(
                 guard.record_account_pin(Provider::Gemini, lookup_keys, Some(&stream_res.account_id));
             }
             if req.stream.unwrap_or(false) {
-                handle_gemini_messages_stream(stream_res, model_name)
+                handle_gemini_messages_stream(stream_res, model_name, &history_key)
             } else {
-                handle_gemini_messages_buffered(stream_res, model_name).await
+                handle_gemini_messages_buffered(stream_res, model_name, &history_key).await
             }
         }
         Err(err) => attempt_error_to_response(&err),
@@ -391,7 +458,13 @@ pub async fn v1_messages_handler(
 
     tracing::debug!("--> POST /v1/messages (model: {model})");
 
-    let candidates = match resolve_route_candidates(&model, MappingEndpoint::Messages, req.effort.as_deref()) {
+    let effort = requested_effort(
+        req.effort.as_deref(),
+        req.reasoning_effort.as_deref(),
+        req.reasoning.as_ref(),
+        req.output_config.as_ref(),
+    );
+    let candidates = match resolve_route_candidates(&model, MappingEndpoint::Messages, effort.as_deref()) {
         Ok(c) => c,
         Err(err) => {
             return (
@@ -451,8 +524,15 @@ pub async fn v1_messages_handler(
     }
 }
 
-fn handle_gemini_completions_stream(stream_res: GeminiStreamResult, model: &str) -> Response {
+fn handle_gemini_completions_stream(
+    stream_res: GeminiStreamResult,
+    model: &str,
+    history_key: &str,
+    reasoning_excluded: bool,
+) -> Response {
     let mut sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), model);
+    sse_state.history_key = history_key.to_string();
+    sse_state.reasoning_excluded = reasoning_excluded;
     stream_sse_transformed(stream_res.response.bytes_stream(), move |line| {
         if let Some(parsed) = parse_gemini_sse_line(line) {
             gemini_to_openai_sse(&parsed, &mut sse_state)
@@ -462,15 +542,41 @@ fn handle_gemini_completions_stream(stream_res: GeminiStreamResult, model: &str)
     })
 }
 
-async fn handle_gemini_completions_buffered(stream_res: GeminiStreamResult, model: &str) -> Response {
+async fn handle_gemini_completions_buffered(
+    stream_res: GeminiStreamResult,
+    model: &str,
+    history_key: &str,
+    reasoning_excluded: bool,
+) -> Response {
     let full_body = stream_res.response.text().await.unwrap_or_default();
     let chunks: Vec<Value> = full_body.lines().filter_map(parse_gemini_sse_line).collect();
     let res = collect_gemini_response(&chunks);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    if let Some(sig) = res.thought_signature.as_deref() {
+        record_history(history_key, sig, &res.reasoning);
+    }
 
     let mut message = serde_json::json!({ "role": "assistant", "content": res.text });
+    if !res.reasoning.is_empty() && !reasoning_excluded {
+        message["reasoning"] = Value::String(res.reasoning.clone());
+        message["reasoning_content"] = Value::String(res.reasoning.clone());
+    }
+    let token = mint_reasoning_token(res.thought_signature.as_deref().unwrap_or(""), &res.reasoning);
+    if (!res.reasoning.is_empty() || !token.is_empty()) && !reasoning_excluded {
+        let mut entry = serde_json::json!({
+            "type": "reasoning.text",
+            "id": Value::Null,
+            "text": res.reasoning,
+            "format": reasoning_format_for(model),
+            "index": 0
+        });
+        if !token.is_empty() {
+            entry["signature"] = Value::String(token);
+        }
+        message["reasoning_details"] = Value::Array(vec![entry]);
+    }
     let mut finish_reason = "stop";
     if !res.function_calls.is_empty() {
         finish_reason = "tool_calls";
@@ -524,22 +630,34 @@ async fn dispatch_gemini_completions(
     preferred_account_id: Option<String>,
     lookup_keys: &[String],
 ) -> Response {
-    let is_thinking_requested = req.effort.is_some();
+    let is_thinking_requested = requested_effort(
+        req.effort.as_deref(),
+        req.reasoning_effort.as_deref(),
+        req.reasoning.as_ref(),
+        req.output_config.as_ref(),
+    )
+    .is_some();
     let raw_val = serde_json::to_value(req).unwrap_or_default();
     let messages_val = serde_json::to_value(&req.messages).unwrap_or_default();
 
-    let (system_instruction, contents) = match map_messages_to_gemini(&messages_val, None, is_thinking_requested) {
-        Ok(res) => res,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": { "message": err.to_string(), "type": "invalid_request_error" }
-                })),
-            )
-                .into_response();
-        }
+    let history_ctx = crate::utils::history_cache::HistoryContext {
+        model: req.model.clone().unwrap_or_default(),
+        system: Value::Null,
+        tools: serde_json::to_value(&req.tools).unwrap_or(Value::Null),
     };
+    let (system_instruction, contents) =
+        match map_messages_to_gemini(&messages_val, None, is_thinking_requested, Some(&history_ctx)) {
+            Ok(res) => res,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": { "message": err.to_string(), "type": "invalid_request_error" }
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     let generation_config = build_generation_config(&raw_val, &route.upstream_model, is_thinking_requested);
 
@@ -558,6 +676,13 @@ async fn dispatch_gemini_completions(
     };
 
     let model_name = req.model.as_deref().unwrap_or(&route.upstream_model);
+    let history_key = gemini_history_key(
+        req.model.as_deref(),
+        &messages_val,
+        &Value::Null,
+        &serde_json::to_value(&req.tools).unwrap_or(Value::Null),
+    );
+    let excluded = reasoning_excluded(req.reasoning.as_ref());
     match call_gemini_stream(&params, &state.pool, &state.http_client).await {
         Ok(stream_res) => {
             {
@@ -565,9 +690,9 @@ async fn dispatch_gemini_completions(
                 guard.record_account_pin(Provider::Gemini, lookup_keys, Some(&stream_res.account_id));
             }
             if req.stream.unwrap_or(false) {
-                handle_gemini_completions_stream(stream_res, model_name)
+                handle_gemini_completions_stream(stream_res, model_name, &history_key, excluded)
             } else {
-                handle_gemini_completions_buffered(stream_res, model_name).await
+                handle_gemini_completions_buffered(stream_res, model_name, &history_key, excluded).await
             }
         }
         Err(err) => attempt_error_to_response(&err),
@@ -848,7 +973,13 @@ pub async fn v1_chat_completions_handler(
 
     tracing::debug!("--> POST /v1/chat/completions (model: {model})");
 
-    let candidates = match resolve_route_candidates(&model, MappingEndpoint::OpenAi, req.effort.as_deref()) {
+    let effort = requested_effort(
+        req.effort.as_deref(),
+        req.reasoning_effort.as_deref(),
+        req.reasoning.as_ref(),
+        req.output_config.as_ref(),
+    );
+    let candidates = match resolve_route_candidates(&model, MappingEndpoint::OpenAi, effort.as_deref()) {
         Ok(c) => c,
         Err(err) => {
             return (
@@ -915,6 +1046,47 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::app::{AppState, create_app};
+
+    use super::{CompletionsRequest, requested_effort};
+
+    #[test]
+    fn test_requested_effort_prefers_explicit_effort() {
+        let req: CompletionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "x",
+            "effort": "low",
+            "reasoning_effort": "high",
+            "reasoning": { "effort": "max" },
+            "output_config": { "effort": "medium" }
+        }))
+        .unwrap();
+        assert_eq!(
+            requested_effort(
+                req.effort.as_deref(),
+                req.reasoning_effort.as_deref(),
+                req.reasoning.as_ref(),
+                req.output_config.as_ref()
+            ),
+            Some("low".to_string())
+        );
+        let raw = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            raw.get("reasoning_effort").and_then(serde_json::Value::as_str),
+            Some("high")
+        );
+
+        let minimal: CompletionsRequest = serde_json::from_value(serde_json::json!({ "model": "x" })).unwrap();
+        assert_eq!(
+            requested_effort(
+                minimal.effort.as_deref(),
+                minimal.reasoning_effort.as_deref(),
+                minimal.reasoning.as_ref(),
+                minimal.output_config.as_ref()
+            ),
+            None
+        );
+        let raw_minimal = serde_json::to_value(&minimal).unwrap();
+        assert_eq!(raw_minimal.get("reasoning_effort"), None);
+    }
 
     #[tokio::test]
     async fn test_messages_endpoint_rejects_missing_model() {

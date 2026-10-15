@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::mappers::media::{MediaError, parse_anthropic_media_block, parse_openai_media_block, render_for_gemini};
-use crate::utils::history_cache::{DUMMY_SIGNATURE, FALLBACK_SIGNATURE, lookup_tool_signature};
+use crate::utils::history_cache::{
+    DUMMY_SIGNATURE, FALLBACK_SIGNATURE, HistoryContext, history_key_chain, lookup_history, lookup_tool_signature,
+    resolve_reasoning_token,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeminiContent {
@@ -100,6 +103,7 @@ pub fn resolve_function_response_name(messages: &Value, tool_use_id: &str, fallb
 pub fn map_content_parts(
     content: &Value,
     messages: &Value,
+    injected_sig: Option<&str>,
     is_thinking_requested: bool,
 ) -> Result<Vec<Value>, MapperError> {
     if let Some(s) = content.as_str() {
@@ -129,14 +133,20 @@ pub fn map_content_parts(
             }
             "thinking" => {
                 if is_thinking_requested {
-                    let sig = block
-                        .get("signature")
-                        .or_else(|| block.get("thoughtSignature"))
-                        .or_else(|| block.get("thought_signature"))
-                        .and_then(Value::as_str);
+                    let mut sig: Option<String> = injected_sig.map(str::to_string);
+                    if sig.is_none() {
+                        let raw = block
+                            .get("signature")
+                            .or_else(|| block.get("thoughtSignature"))
+                            .or_else(|| block.get("thought_signature"))
+                            .and_then(Value::as_str);
+                        if let Some(raw_str) = raw {
+                            sig = resolve_reasoning_token(raw_str).map(|r| r.signature);
+                        }
+                    }
 
-                    if let Some(sig_str) = sig
-                        && sig_str != "dummy_sig_from_proxy"
+                    if let Some(sig_str) = sig.as_deref()
+                        && sig_str != DUMMY_SIGNATURE
                     {
                         let thinking_text = block.get("thinking").and_then(Value::as_str).unwrap_or("");
                         parts.push(serde_json::json!({
@@ -204,6 +214,151 @@ fn signature_for_message(m: &Value, content_val: &Value) -> Option<String> {
     None
 }
 
+fn client_reasoning_token(m: &Value) -> (Option<String>, Option<String>) {
+    let mut token: Option<String> = None;
+    if let Some(blocks) = m.get("content").and_then(Value::as_array) {
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) == Some("thinking") && token.is_none() {
+                token = block
+                    .get("signature")
+                    .or_else(|| block.get("thoughtSignature"))
+                    .or_else(|| block.get("thought_signature"))
+                    .and_then(Value::as_str)
+                    .filter(|s| *s != DUMMY_SIGNATURE)
+                    .map(str::to_string);
+            }
+        }
+    }
+    let mut details_text: Option<String> = None;
+    let details = m.get("reasoning_details");
+    if let Some(arr) = details.and_then(Value::as_array) {
+        for d in arr {
+            if token.is_none() {
+                token = d
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .filter(|s| *s != DUMMY_SIGNATURE)
+                    .map(str::to_string);
+            }
+            if details_text.is_none() {
+                details_text = d
+                    .get("reasoning_content")
+                    .or_else(|| d.get("text"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+        }
+    } else if let Some(single) = details.filter(|d| d.is_object()) {
+        if token.is_none() {
+            token = single
+                .get("signature")
+                .and_then(Value::as_str)
+                .filter(|s| *s != DUMMY_SIGNATURE)
+                .map(str::to_string);
+        }
+        details_text = single
+            .get("reasoning_content")
+            .or_else(|| single.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    let text = m
+        .get("reasoning")
+        .or_else(|| m.get("reasoning_content"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or(details_text);
+    (token, text)
+}
+
+fn inbound_signature(
+    m: &Value,
+    content_val: &Value,
+    is_assistant: bool,
+    is_thinking_requested: bool,
+) -> (Option<String>, Option<String>) {
+    let mut signature: Option<String> = None;
+    let mut reasoning: Option<String> = None;
+    if is_assistant {
+        let (token, text) = client_reasoning_token(m);
+        reasoning = text;
+        if is_thinking_requested
+            && let Some(tok) = token
+            && let Some(resolved) = resolve_reasoning_token(&tok)
+        {
+            signature = Some(resolved.signature);
+            if reasoning.as_deref().is_none_or(str::is_empty) {
+                reasoning = Some(resolved.reasoning);
+            }
+        }
+    }
+    if signature.is_none() {
+        signature = signature_for_message(m, content_val);
+    }
+    (signature, reasoning)
+}
+
+fn push_system_text(system_texts: &mut Vec<String>, content_val: &Value) {
+    if let Some(txt) = content_val.as_str() {
+        system_texts.push(txt.to_string());
+    } else if let Some(sub_arr) = content_val.as_array() {
+        for block in sub_arr {
+            if let Some(txt) = block.get("text").and_then(Value::as_str) {
+                system_texts.push(txt.to_string());
+            }
+        }
+    }
+}
+
+fn map_tool_message(m: &Value, messages: &Value, content_val: &Value) -> GeminiContent {
+    let tool_call_id = m.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
+    let name = resolve_function_response_name(messages, tool_call_id, m.get("name").and_then(Value::as_str));
+    let resp = parse_function_response(content_val);
+    GeminiContent {
+        role: "user".to_string(),
+        parts: vec![serde_json::json!({
+            "functionResponse": {
+                "name": name,
+                "response": resp,
+                "id": tool_call_id
+            }
+        })],
+    }
+}
+
+fn append_tool_calls(parts: &mut Vec<Value>, m: &Value) {
+    let Some(tool_calls) = m.get("tool_calls").and_then(Value::as_array) else {
+        return;
+    };
+    for tc in tool_calls {
+        let function = tc.get("function");
+        let name = function
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let raw_args = function
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str)
+            .unwrap_or("{}");
+        let args = serde_json::from_str::<Value>(raw_args).unwrap_or(serde_json::json!({}));
+        let id = tc.get("id").and_then(Value::as_str);
+        parts.push(serde_json::json!({
+            "functionCall": {
+                "name": name,
+                "args": args,
+                "id": id
+            }
+        }));
+    }
+}
+
+fn prefix_history_entry(
+    idx: usize,
+    key_chain: Option<&Vec<String>>,
+) -> Option<crate::utils::history_cache::HistoryEntry> {
+    key_chain?.get(idx).and_then(|k| lookup_history(k))
+}
+
 fn attach_thought_signature(
     parts: &mut Vec<Value>,
     signature: Option<String>,
@@ -245,6 +400,7 @@ pub fn map_messages_to_gemini(
     messages: &Value,
     system_prompt: Option<&str>,
     is_thinking_requested: bool,
+    history: Option<&HistoryContext>,
 ) -> Result<(Option<GeminiSystemInstruction>, Vec<GeminiContent>), MapperError> {
     let mut system_texts = Vec::new();
     if let Some(sp) = system_prompt
@@ -257,71 +413,88 @@ pub fn map_messages_to_gemini(
         .as_array()
         .ok_or_else(|| MapperError::InvalidFormat("messages must be an array".to_string()))?;
 
+    let key_chain: Option<Vec<String>> = history.map(|h| history_key_chain(&h.model, messages, &h.system, &h.tools));
+
     let mut contents = Vec::new();
 
-    for m in arr {
+    for (idx, m) in arr.iter().enumerate() {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
         let content_val = m.get("content").unwrap_or(&Value::Null);
 
         if role == "system" {
-            if let Some(txt) = content_val.as_str() {
-                system_texts.push(txt.to_string());
-            } else if let Some(sub_arr) = content_val.as_array() {
-                for block in sub_arr {
-                    if let Some(txt) = block.get("text").and_then(Value::as_str) {
-                        system_texts.push(txt.to_string());
-                    }
-                }
-            }
+            push_system_text(&mut system_texts, content_val);
             continue;
         }
 
         if role == "tool" {
-            let tool_call_id = m.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
-            let name = resolve_function_response_name(messages, tool_call_id, m.get("name").and_then(Value::as_str));
-            let resp = parse_function_response(content_val);
-            contents.push(GeminiContent {
-                role: "user".to_string(),
-                parts: vec![serde_json::json!({
-                    "functionResponse": {
-                        "name": name,
-                        "response": resp,
-                        "id": tool_call_id
-                    }
-                })],
-            });
+            contents.push(map_tool_message(m, messages, content_val));
             continue;
         }
 
         let is_assistant = role == "assistant";
         let target_role = if is_assistant { "model" } else { "user" };
-        let mut parts = map_content_parts(content_val, messages, is_thinking_requested)?;
 
-        if is_assistant && let Some(tool_calls) = m.get("tool_calls").and_then(Value::as_array) {
-            for tc in tool_calls {
-                let function = tc.get("function");
-                let name = function
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let raw_args = function
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("{}");
-                let args = serde_json::from_str::<Value>(raw_args).unwrap_or(serde_json::json!({}));
-                let id = tc.get("id").and_then(Value::as_str);
+        let (mut signature_to_inject, reasoning_text) =
+            inbound_signature(m, content_val, is_assistant, is_thinking_requested);
+
+        let mut parts = Vec::new();
+        if signature_to_inject.is_none()
+            && target_role == "model"
+            && let Some(entry) = prefix_history_entry(idx, key_chain.as_ref())
+        {
+            let has_thinking = content_val.as_array().is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
+            });
+            if !entry.reasoning.is_empty() && !has_thinking {
                 parts.push(serde_json::json!({
-                    "functionCall": {
-                        "name": name,
-                        "args": args,
-                        "id": id
-                    }
+                    "text": entry.reasoning,
+                    "thought": true,
+                    "thoughtSignature": entry.thought_signature,
+                    "thought_signature": entry.thought_signature
                 }));
             }
+            signature_to_inject = Some(entry.thought_signature);
         }
 
-        let signature = signature_for_message(m, content_val);
-        attach_thought_signature(&mut parts, signature, target_role == "model", is_thinking_requested);
+        parts.extend(map_content_parts(
+            content_val,
+            messages,
+            signature_to_inject.as_deref(),
+            is_thinking_requested,
+        )?);
+
+        if is_assistant {
+            append_tool_calls(&mut parts, m);
+        }
+
+        let has_thought_part = parts
+            .iter()
+            .any(|p| p.get("thought").and_then(Value::as_bool) == Some(true));
+        if target_role == "model"
+            && is_thinking_requested
+            && !has_thought_part
+            && let Some(text) = reasoning_text.as_deref().filter(|s| !s.is_empty())
+            && let Some(sig) = signature_to_inject.clone().filter(|s| s != DUMMY_SIGNATURE)
+        {
+            parts.insert(
+                0,
+                serde_json::json!({
+                    "text": text,
+                    "thought": true,
+                    "thoughtSignature": sig,
+                    "thought_signature": sig
+                }),
+            );
+        }
+
+        attach_thought_signature(
+            &mut parts,
+            signature_to_inject,
+            target_role == "model",
+            is_thinking_requested,
+        );
 
         contents.push(GeminiContent {
             role: target_role.to_string(),
@@ -642,7 +815,7 @@ mod tests {
             },
             { "role": "tool", "tool_call_id": "call_1", "content": "file text" }
         ]);
-        let (_, contents) = map_messages_to_gemini(&messages, None, false).unwrap();
+        let (_, contents) = map_messages_to_gemini(&messages, None, false, None).unwrap();
         assert_eq!(
             contents[1].parts[0]["functionResponse"]["name"],
             serde_json::json!("read")
@@ -655,7 +828,7 @@ mod tests {
             { "role": "user", "content": "hi" },
             { "role": "tool", "tool_call_id": "call_missing", "content": "out" }
         ]);
-        let (_, contents) = map_messages_to_gemini(&messages, None, false).unwrap();
+        let (_, contents) = map_messages_to_gemini(&messages, None, false, None).unwrap();
         assert_eq!(
             contents[1].parts[0]["functionResponse"]["name"],
             serde_json::json!("unknown_tool")
@@ -674,7 +847,7 @@ mod tests {
                 "content": [{ "type": "tool_result", "tool_use_id": "call_9", "content": "ok" }]
             }
         ]);
-        let (_, contents) = map_messages_to_gemini(&messages, None, false).unwrap();
+        let (_, contents) = map_messages_to_gemini(&messages, None, false, None).unwrap();
         assert_eq!(
             contents[1].parts[0]["functionResponse"]["name"],
             serde_json::json!("write")
@@ -694,7 +867,7 @@ mod tests {
             },
             { "role": "tool", "tool_call_id": "test-sig-call-1", "content": "file text" }
         ]);
-        let (_, contents) = map_messages_to_gemini(&messages, None, true).unwrap();
+        let (_, contents) = map_messages_to_gemini(&messages, None, true, None).unwrap();
         let fc = contents[0]
             .parts
             .iter()
@@ -715,7 +888,7 @@ mod tests {
                 ]
             }
         ]);
-        let (_, contents) = map_messages_to_gemini(&messages, None, true).unwrap();
+        let (_, contents) = map_messages_to_gemini(&messages, None, true, None).unwrap();
         let fc = contents[0]
             .parts
             .iter()
@@ -738,7 +911,7 @@ mod tests {
                 ]
             }
         ]);
-        let (_, contents) = map_messages_to_gemini(&messages, None, false).unwrap();
+        let (_, contents) = map_messages_to_gemini(&messages, None, false, None).unwrap();
         let fc = contents[0]
             .parts
             .iter()
@@ -748,9 +921,61 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_details_token_replays_thought() {
+        let token = crate::utils::history_cache::mint_reasoning_token("real_sig_echo", "prior reasoning");
+        let messages = serde_json::json!([
+            {
+                "role": "assistant",
+                "content": "answer text",
+                "reasoning_details": [{ "type": "reasoning.text", "text": "prior reasoning", "signature": token }]
+            }
+        ]);
+        let (_, contents) = map_messages_to_gemini(&messages, None, true, None).unwrap();
+        let thought = contents[0].parts.iter().find(|p| p.get("thought").is_some()).unwrap();
+        assert_eq!(thought.get("text").and_then(Value::as_str), Some("prior reasoning"));
+        assert_eq!(
+            thought.get("thoughtSignature").and_then(Value::as_str),
+            Some("real_sig_echo")
+        );
+    }
+
+    #[test]
+    fn test_prefix_history_key_replays_thought() {
+        use crate::utils::history_cache::{HistoryContext, history_key, record_history};
+        let messages = serde_json::json!([
+            { "role": "user", "content": "do it" },
+            {
+                "role": "assistant",
+                "content": "working",
+                "tool_calls": [
+                    { "id": "test-prefix-1", "type": "function", "function": { "name": "read", "arguments": "{}" } }
+                ]
+            }
+        ]);
+        let ctx = HistoryContext {
+            model: "m".to_string(),
+            system: serde_json::Value::Null,
+            tools: serde_json::Value::Null,
+        };
+        let prefix = serde_json::json!([{ "role": "user", "content": "do it" }]);
+        let key = history_key("m", &prefix, &serde_json::Value::Null, &serde_json::Value::Null);
+        record_history(&key, "pxsig_prefix", "prefix thought");
+        let (_, contents) = map_messages_to_gemini(&messages, None, true, Some(&ctx)).unwrap();
+        let assistant = &contents[1];
+        let thought = assistant.parts.iter().find(|p| p.get("thought").is_some()).unwrap();
+        assert_eq!(thought.get("text").and_then(Value::as_str), Some("prefix thought"));
+        let fc = assistant
+            .parts
+            .iter()
+            .find(|p| p.get("functionCall").is_some())
+            .unwrap();
+        assert_eq!(fc.get("thoughtSignature").and_then(Value::as_str), Some("pxsig_prefix"));
+    }
+
+    #[test]
     fn test_map_content_parts_string_and_blocks() {
         let string_content = serde_json::json!("hello world");
-        let parts = map_content_parts(&string_content, &serde_json::Value::Null, false).unwrap();
+        let parts = map_content_parts(&string_content, &serde_json::Value::Null, None, false).unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(
             parts[0].get("text").and_then(serde_json::Value::as_str),
@@ -761,22 +986,23 @@ mod tests {
             { "type": "text", "text": "foo" },
             { "type": "tool_use", "id": "call_1", "name": "get_weather", "input": { "city": "Paris" } }
         ]);
-        let parts2 = map_content_parts(&blocks_content, &serde_json::Value::Null, false).unwrap();
+        let parts2 = map_content_parts(&blocks_content, &serde_json::Value::Null, None, false).unwrap();
         assert_eq!(parts2.len(), 2);
         assert_eq!(parts2[0].get("text").and_then(serde_json::Value::as_str), Some("foo"));
         assert!(parts2[1].get("functionCall").is_some());
     }
 
     #[test]
-    fn test_map_content_parts_thinking_block_preserves_signature() {
+    fn test_map_content_parts_thinking_block_resolves_token() {
+        let token = crate::utils::history_cache::mint_reasoning_token("real_upstream_sig", "thought process");
         let blocks = serde_json::json!([
             {
                 "type": "thinking",
                 "thinking": "thought process",
-                "signature": "sig_123"
+                "signature": token
             }
         ]);
-        let parts = map_content_parts(&blocks, &serde_json::Value::Null, true).unwrap();
+        let parts = map_content_parts(&blocks, &serde_json::Value::Null, None, true).unwrap();
         assert_eq!(parts.len(), 1);
         let part = &parts[0];
         assert_eq!(
@@ -786,8 +1012,21 @@ mod tests {
         assert_eq!(part.get("thought").and_then(serde_json::Value::as_bool), Some(true));
         assert_eq!(
             part.get("thoughtSignature").and_then(serde_json::Value::as_str),
-            Some("sig_123")
+            Some("real_upstream_sig")
         );
+    }
+
+    #[test]
+    fn test_map_content_parts_thinking_block_drops_unknown_signature() {
+        let blocks = serde_json::json!([
+            {
+                "type": "thinking",
+                "thinking": "thought process",
+                "signature": "sig_123"
+            }
+        ]);
+        let parts = map_content_parts(&blocks, &serde_json::Value::Null, None, true).unwrap();
+        assert_eq!(parts, [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -866,7 +1105,7 @@ mod tests {
             { "role": "user", "content": "Hi" },
             { "role": "assistant", "content": "Hello!" }
         ]);
-        let (system_instruction, contents) = map_messages_to_gemini(&messages, None, false).unwrap();
+        let (system_instruction, contents) = map_messages_to_gemini(&messages, None, false, None).unwrap();
         assert!(system_instruction.is_some());
         assert_eq!(contents.len(), 2);
         assert_eq!(contents[0].role, "user");

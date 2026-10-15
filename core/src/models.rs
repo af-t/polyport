@@ -22,6 +22,10 @@ pub struct ModelDescriptor {
     pub effort: Vec<String>,
     #[serde(default)]
     pub modalities: Option<ModelModalities>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub max_output: Option<u64>,
 }
 
 pub const MODELS_JSON: &str = include_str!("models.json");
