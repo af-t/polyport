@@ -122,12 +122,10 @@ pub fn build_generation_config(body: &Value, resolved_model: &str, is_thinking_r
             max_output_tokens = b_u32 + 1024;
         }
 
-        if budget > 0 || model_lower.contains("claude") {
-            thinking_config = Some(ThinkingConfig {
-                include_thoughts: true,
-                thinking_budget: budget,
-            });
-        }
+        thinking_config = Some(ThinkingConfig {
+            include_thoughts: true,
+            thinking_budget: budget,
+        });
     }
 
     GenerationConfig {
@@ -365,6 +363,16 @@ mod tests {
         let tc = config.thinking_config.unwrap();
         assert!(tc.include_thoughts);
         assert_eq!(tc.thinking_budget, 8192);
+    }
+
+    #[test]
+    fn test_build_generation_config_dynamic_thinking_when_no_budget() {
+        let body = serde_json::json!({});
+        let config = build_generation_config(&body, "gemini-3.8-flash-tiered", true);
+        assert!(config.thinking_config.is_some());
+        let tc = config.thinking_config.unwrap();
+        assert!(tc.include_thoughts);
+        assert_eq!(tc.thinking_budget, -1);
     }
 
     #[test]

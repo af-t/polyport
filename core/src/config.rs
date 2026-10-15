@@ -469,6 +469,21 @@ pub fn resolve_route(requested_model: &str, effort: Option<&str>) -> Result<Rout
 }
 
 #[must_use]
+pub fn model_supports_thinking(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("gemini-3.1-pro") || lower.contains("gemini-3.6-flash") {
+        return true;
+    }
+    !lower.contains("low")
+        && (lower.contains("thinking")
+            || lower.contains("agent")
+            || lower.contains("opus")
+            || lower.contains("sonnet")
+            || lower.contains("fable")
+            || lower.contains("flash"))
+}
+
+#[must_use]
 pub fn max_gemini_output_tokens(model: &str) -> u32 {
     let lower = model.to_ascii_lowercase();
     if lower.contains("claude") {
@@ -532,6 +547,16 @@ mod tests {
         assert_eq!(err.to_string(), "model: nonexistent-model is not supported");
 
         assert!(resolve_route("", None).is_err());
+    }
+
+    #[test]
+    fn test_model_supports_thinking() {
+        assert!(model_supports_thinking("gemini-3.8-flash"));
+        assert!(model_supports_thinking("gemini-3.8-flash-high"));
+        assert!(model_supports_thinking("gemini-3.8-flash-tiered"));
+        assert!(model_supports_thinking("claude-opus-4-6-thinking"));
+        assert!(!model_supports_thinking("gemini-3.8-flash-low"));
+        assert!(!model_supports_thinking("gpt-oss-120b-medium"));
     }
 
     #[test]

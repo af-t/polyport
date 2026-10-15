@@ -265,7 +265,8 @@ async fn dispatch_gemini_messages(
             req.reasoning.as_ref(),
             req.output_config.as_ref(),
         )
-        .is_some();
+        .is_some()
+        || crate::config::model_supports_thinking(&route.upstream_model);
     let system_str = match &req.system {
         Some(Value::String(s)) => Some(s.as_str()),
         _ => None,
@@ -883,7 +884,8 @@ async fn dispatch_gemini_completions(
         req.reasoning.as_ref(),
         req.output_config.as_ref(),
     )
-    .is_some();
+    .is_some()
+        || crate::config::model_supports_thinking(&route.upstream_model);
     let raw_val = serde_json::to_value(req).unwrap_or_default();
     let messages_val = serde_json::to_value(&req.messages).unwrap_or_default();
 
