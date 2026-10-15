@@ -36,6 +36,9 @@ pub struct AnthropicStreamState {
     pub reasoning: String,
     pub tool_ids: Vec<String>,
     pub history_key: String,
+    pub full_text: String,
+    pub streamed_tools: Vec<GeminiFunctionCall>,
+    pub finish_reason: Option<String>,
 }
 
 impl AnthropicStreamState {
@@ -54,6 +57,9 @@ impl AnthropicStreamState {
             reasoning: String::new(),
             tool_ids: Vec::new(),
             history_key: String::new(),
+            full_text: String::new(),
+            streamed_tools: Vec::new(),
+            finish_reason: None,
         }
     }
 }
@@ -94,7 +100,11 @@ fn note_tool_call(state_sig: &str, tool_ids: &mut Vec<String>, tool_id: &str) {
 
 fn gemini_part_to_anthropic(part: &Value, state: &mut AnthropicStreamState) -> Vec<String> {
     let mut events = Vec::new();
+    let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
     if let Some(text) = part.get("text").and_then(Value::as_str) {
+        if !is_thought {
+            state.full_text.push_str(text);
+        }
         if !state.text_block_started {
             state.text_block_started = true;
             let block_start = serde_json::json!({
@@ -129,6 +139,10 @@ fn gemini_part_to_anthropic(part: &Value, state: &mut AnthropicStreamState) -> V
     if let Some(fc) = part.get("functionCall") {
         let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
         let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+        state.streamed_tools.push(GeminiFunctionCall {
+            name: name.to_string(),
+            args: args.clone(),
+        });
         let tool_id = format!("toolu_{}", uuid::Uuid::new_v4());
         note_tool_call(&state.thought_signature, &mut state.tool_ids, &tool_id);
         let block_start = serde_json::json!({
@@ -216,6 +230,7 @@ pub fn gemini_to_anthropic_sse(chunk: &Value, state: &mut AnthropicStreamState) 
     let finish_reason = candidate.and_then(|c| c.get("finishReason")).and_then(Value::as_str);
     if (finish_reason.is_some() || chunk.get("response").is_none()) && !state.finished {
         state.finished = true;
+        state.finish_reason = finish_reason.map(str::to_string);
         if state.text_block_started {
             let block_stop = serde_json::json!({
                 "type": "content_block_stop",
@@ -252,6 +267,11 @@ pub struct OpenAiStreamState {
     pub tool_ids: Vec<String>,
     pub history_key: String,
     pub reasoning_excluded: bool,
+    pub full_text: String,
+    pub streamed_tools: Vec<GeminiFunctionCall>,
+    pub finish_reason: Option<String>,
+    pub prompt_tokens: u32,
+    pub output_tokens: u32,
 }
 
 impl OpenAiStreamState {
@@ -271,6 +291,11 @@ impl OpenAiStreamState {
             tool_ids: Vec::new(),
             history_key: String::new(),
             reasoning_excluded: false,
+            full_text: String::new(),
+            streamed_tools: Vec::new(),
+            finish_reason: None,
+            prompt_tokens: 0,
+            output_tokens: 0,
         }
     }
 }
@@ -325,9 +350,82 @@ pub fn reasoning_details_chunk(
     }))
 }
 
+fn gemini_part_to_openai(part: &Value, state: &mut OpenAiStreamState) -> Vec<String> {
+    let mut events = Vec::new();
+    note_part_signature(
+        &mut state.thought_signature,
+        &mut state.reasoning,
+        &state.tool_ids,
+        &state.history_key,
+        part,
+    );
+    if let Some(text) = part.get("text").and_then(Value::as_str) {
+        if part.get("thought").and_then(Value::as_bool) != Some(true) {
+            state.full_text.push_str(text);
+        }
+        let text_chunk = serde_json::json!({
+            "id": &state.completion_id,
+            "object": "chat.completion.chunk",
+            "created": state.created,
+            "model": &state.model,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": text
+                },
+                "finish_reason": serde_json::Value::Null
+            }]
+        });
+        events.push(format!("data: {text_chunk}\n\n"));
+    }
+
+    if let Some(fc) = part.get("functionCall") {
+        let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
+        let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+        state.streamed_tools.push(GeminiFunctionCall {
+            name: name.to_string(),
+            args: args.clone(),
+        });
+        let call_id = format!("call_{}", uuid::Uuid::new_v4());
+        note_tool_call(&state.thought_signature, &mut state.tool_ids, &call_id);
+        let tc_chunk = serde_json::json!({
+            "id": &state.completion_id,
+            "object": "chat.completion.chunk",
+            "created": state.created,
+            "model": &state.model,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": args.to_string()
+                        }
+                    }]
+                },
+                "finish_reason": serde_json::Value::Null
+            }]
+        });
+        events.push(format!("data: {tc_chunk}\n\n"));
+    }
+    events
+}
+
 #[must_use]
 pub fn gemini_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec<String> {
     let mut events = Vec::new();
+
+    if let Some(usage) = chunk.get("response").and_then(|r| r.get("usageMetadata")) {
+        if let Some(prompt) = usage.get("promptTokenCount").and_then(Value::as_u64) {
+            state.prompt_tokens = u32::try_from(prompt).unwrap_or(0);
+        }
+        if let Some(cand) = usage.get("candidatesTokenCount").and_then(Value::as_u64) {
+            state.output_tokens = u32::try_from(cand).unwrap_or(0);
+        }
+    }
 
     if !state.started {
         state.started = true;
@@ -361,64 +459,14 @@ pub fn gemini_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec
 
     if let Some(parts_arr) = parts {
         for part in parts_arr {
-            note_part_signature(
-                &mut state.thought_signature,
-                &mut state.reasoning,
-                &state.tool_ids,
-                &state.history_key,
-                part,
-            );
-            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                let text_chunk = serde_json::json!({
-                    "id": &state.completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": state.created,
-                    "model": &state.model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "content": text
-                        },
-                        "finish_reason": serde_json::Value::Null
-                    }]
-                });
-                events.push(format!("data: {text_chunk}\n\n"));
-            }
-
-            if let Some(fc) = part.get("functionCall") {
-                let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
-                let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
-                let call_id = format!("call_{}", uuid::Uuid::new_v4());
-                note_tool_call(&state.thought_signature, &mut state.tool_ids, &call_id);
-                let tc_chunk = serde_json::json!({
-                    "id": &state.completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": state.created,
-                    "model": &state.model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "tool_calls": [{
-                                "index": 0,
-                                "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": args.to_string()
-                                }
-                            }]
-                        },
-                        "finish_reason": serde_json::Value::Null
-                    }]
-                });
-                events.push(format!("data: {tc_chunk}\n\n"));
-            }
+            events.extend(gemini_part_to_openai(part, state));
         }
     }
 
     let finish_reason = candidate.and_then(|c| c.get("finishReason")).and_then(Value::as_str);
     if (finish_reason.is_some() || chunk.get("response").is_none()) && !state.finished {
         state.finished = true;
+        state.finish_reason = finish_reason.map(str::to_string);
         finish_openai_gemini_turn(state, &mut events);
     }
 
@@ -867,6 +915,62 @@ mod tests {
         let all_text = events.join("\n");
         assert!(all_text.contains("chat.completion.chunk"));
         assert!(all_text.contains("[DONE]"));
+    }
+
+    #[test]
+    fn test_gemini_openai_translator_accumulates_turn() {
+        let mut state = OpenAiStreamState::new("test-cmpl-acc", "m");
+        let chunk = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": { "parts": [
+                        { "text": "hello" },
+                        { "text": "secret", "thought": true, "thoughtSignature": "sig_acc_1" },
+                        { "functionCall": { "name": "read", "args": { "p": "v" } } }
+                    ] },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 3 }
+            }
+        });
+        let _ = gemini_to_openai_sse(&chunk, &mut state);
+        assert_eq!(state.full_text, "hello");
+        assert_eq!(state.reasoning, "secret");
+        assert_eq!(state.thought_signature, "sig_acc_1");
+        assert_eq!(state.streamed_tools.len(), 1);
+        assert_eq!(state.streamed_tools[0].name, "read");
+        assert_eq!(state.streamed_tools[0].args, serde_json::json!({ "p": "v" }));
+        assert_eq!(state.prompt_tokens, 5);
+        assert_eq!(state.output_tokens, 3);
+        assert_eq!(state.finish_reason.as_deref(), Some("STOP"));
+        assert!(state.finished);
+    }
+
+    #[test]
+    fn test_gemini_anthropic_translator_accumulates_turn() {
+        let mut state = AnthropicStreamState::new("msg-acc", "m");
+        let chunk = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": { "parts": [
+                        { "text": "visible" },
+                        { "text": "hidden", "thought": true, "thoughtSignature": "sig_acc_2" },
+                        { "functionCall": { "name": "write", "args": {} } }
+                    ] },
+                    "finishReason": "MAX_TOKENS"
+                }],
+                "usageMetadata": { "promptTokenCount": 8, "candidatesTokenCount": 4 }
+            }
+        });
+        let _ = gemini_to_anthropic_sse(&chunk, &mut state);
+        assert_eq!(state.full_text, "visible");
+        assert_eq!(state.reasoning, "hidden");
+        assert_eq!(state.streamed_tools.len(), 1);
+        assert_eq!(state.streamed_tools[0].name, "write");
+        assert_eq!(state.input_tokens, 8);
+        assert_eq!(state.output_tokens, 4);
+        assert_eq!(state.finish_reason.as_deref(), Some("MAX_TOKENS"));
+        assert!(state.finished);
     }
 
     #[test]

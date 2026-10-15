@@ -115,12 +115,15 @@ fn attempt_error_to_response(err: &AttemptError) -> Response {
         .into_response()
 }
 
-fn stream_sse_transformed<F>(
+fn stream_sse_transformed<S, F>(
     mut byte_stream: impl futures::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    mut state: S,
     mut transform: F,
+    on_done: Option<Box<dyn FnOnce(S) + Send + 'static>>,
 ) -> Response
 where
-    F: FnMut(&str) -> Vec<String> + Send + 'static,
+    S: Send + 'static,
+    F: FnMut(&str, &mut S) -> Vec<String> + Send + 'static,
 {
     let (mut tx, rx) = futures::channel::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
     tokio::spawn(async move {
@@ -130,7 +133,7 @@ where
             while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
                 let line_bytes: Vec<u8> = byte_buf.drain(..=pos).collect();
                 if let Ok(line) = std::str::from_utf8(&line_bytes) {
-                    let events = transform(line);
+                    let events = transform(line, &mut state);
                     for ev in events {
                         let _ = tx.send(Ok(axum::body::Bytes::from(ev))).await;
                     }
@@ -139,10 +142,13 @@ where
         }
         let line_opt = std::str::from_utf8(&byte_buf).ok().filter(|s| !s.is_empty());
         if let Some(line) = line_opt {
-            let events = transform(line);
+            let events = transform(line, &mut state);
             for ev in events {
                 let _ = tx.send(Ok(axum::body::Bytes::from(ev))).await;
             }
+        }
+        if let Some(done) = on_done {
+            done(state);
         }
     });
     let body = axum::body::Body::from_stream(rx);
@@ -153,16 +159,34 @@ where
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
 }
 
-fn handle_gemini_messages_stream(stream_res: GeminiStreamResult, model: &str, history_key: &str) -> Response {
+fn handle_gemini_messages_stream(
+    stream_res: GeminiStreamResult,
+    model: &str,
+    history_key: &str,
+    cache_key: &str,
+) -> Response {
     let mut sse_state = AnthropicStreamState::new(&format!("msg_{}", uuid::Uuid::new_v4()), model);
     sse_state.history_key = history_key.to_string();
-    stream_sse_transformed(stream_res.response.bytes_stream(), move |line| {
-        if let Some(parsed) = parse_gemini_sse_line(line) {
-            gemini_to_anthropic_sse(&parsed, &mut sse_state)
-        } else {
-            Vec::new()
-        }
-    })
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let cache_key = cache_key.to_string();
+    stream_sse_transformed(
+        stream_res.response.bytes_stream(),
+        sse_state,
+        move |line, state: &mut AnthropicStreamState| {
+            if let Some(parsed) = parse_gemini_sse_line(line) {
+                gemini_to_anthropic_sse(&parsed, state)
+            } else {
+                Vec::new()
+            }
+        },
+        Some(Box::new(move |state: AnthropicStreamState| {
+            if let Some(entry) = crate::utils::completion_cache::gemini_stream_entry_from_anthropic(&state, now) {
+                crate::utils::completion_cache::write_completion_cache(&cache_key, entry);
+            }
+        })),
+    )
 }
 
 async fn handle_gemini_messages_buffered(
@@ -296,7 +320,7 @@ async fn dispatch_gemini_messages(
                 guard.record_account_pin(Provider::Gemini, lookup_keys, Some(&stream_res.account_id));
             }
             if req.stream.unwrap_or(false) {
-                handle_gemini_messages_stream(stream_res, model_name, &history_key)
+                handle_gemini_messages_stream(stream_res, model_name, &history_key, cache_key)
             } else {
                 handle_gemini_messages_buffered(stream_res, model_name, &history_key, cache_key).await
             }
@@ -365,14 +389,19 @@ async fn dispatch_claude_messages(
 }
 
 fn handle_codex_messages_stream(stream_res: CodexStreamResult, model: &str) -> Response {
-    let mut sse_state = AnthropicStreamState::new(&format!("msg_{}", uuid::Uuid::new_v4()), model);
-    stream_sse_transformed(stream_res.response.bytes_stream(), move |line| {
-        if let Some(parsed) = parse_codex_sse_line(line) {
-            codex_to_anthropic_sse(&parsed, &mut sse_state)
-        } else {
-            Vec::new()
-        }
-    })
+    let sse_state = AnthropicStreamState::new(&format!("msg_{}", uuid::Uuid::new_v4()), model);
+    stream_sse_transformed(
+        stream_res.response.bytes_stream(),
+        sse_state,
+        move |line, state: &mut AnthropicStreamState| {
+            if let Some(parsed) = parse_codex_sse_line(line) {
+                codex_to_anthropic_sse(&parsed, state)
+            } else {
+                Vec::new()
+            }
+        },
+        None,
+    )
 }
 
 async fn handle_codex_messages_buffered(stream_res: CodexStreamResult, model: &str) -> Response {
@@ -647,17 +676,28 @@ fn handle_gemini_completions_stream(
     model: &str,
     history_key: &str,
     reasoning_excluded: bool,
+    cache_key: &str,
 ) -> Response {
     let mut sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), model);
     sse_state.history_key = history_key.to_string();
     sse_state.reasoning_excluded = reasoning_excluded;
-    stream_sse_transformed(stream_res.response.bytes_stream(), move |line| {
-        if let Some(parsed) = parse_gemini_sse_line(line) {
-            gemini_to_openai_sse(&parsed, &mut sse_state)
-        } else {
-            Vec::new()
-        }
-    })
+    let cache_key = cache_key.to_string();
+    stream_sse_transformed(
+        stream_res.response.bytes_stream(),
+        sse_state,
+        move |line, state: &mut OpenAiStreamState| {
+            if let Some(parsed) = parse_gemini_sse_line(line) {
+                gemini_to_openai_sse(&parsed, state)
+            } else {
+                Vec::new()
+            }
+        },
+        Some(Box::new(move |state: OpenAiStreamState| {
+            if let Some(entry) = crate::utils::completion_cache::gemini_stream_entry_from_openai(&state) {
+                crate::utils::completion_cache::write_completion_cache(&cache_key, entry);
+            }
+        })),
+    )
 }
 
 async fn handle_gemini_completions_buffered(
@@ -813,7 +853,7 @@ async fn dispatch_gemini_completions(
                 guard.record_account_pin(Provider::Gemini, lookup_keys, Some(&stream_res.account_id));
             }
             if req.stream.unwrap_or(false) {
-                handle_gemini_completions_stream(stream_res, model_name, &history_key, excluded)
+                handle_gemini_completions_stream(stream_res, model_name, &history_key, excluded, cache_key)
             } else {
                 handle_gemini_completions_buffered(stream_res, model_name, &history_key, excluded, cache_key).await
             }
@@ -880,14 +920,19 @@ fn map_openai_request_to_claude(req: &CompletionsRequest, upstream_model: &str) 
 }
 
 fn handle_claude_completions_stream(stream_res: ClaudeStreamResult, model: &str) -> Response {
-    let mut sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), model);
-    stream_sse_transformed(stream_res.response.bytes_stream(), move |line| {
-        if let Some(parsed) = parse_anthropic_sse_line(line) {
-            anthropic_to_openai_sse(&parsed, &mut sse_state)
-        } else {
-            Vec::new()
-        }
-    })
+    let sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), model);
+    stream_sse_transformed(
+        stream_res.response.bytes_stream(),
+        sse_state,
+        move |line, state: &mut OpenAiStreamState| {
+            if let Some(parsed) = parse_anthropic_sse_line(line) {
+                anthropic_to_openai_sse(&parsed, state)
+            } else {
+                Vec::new()
+            }
+        },
+        None,
+    )
 }
 
 async fn handle_claude_completions_buffered(stream_res: ClaudeStreamResult, model: &str, cache_key: &str) -> Response {
@@ -975,14 +1020,19 @@ async fn dispatch_claude_completions(
 }
 
 fn handle_codex_completions_stream(stream_res: CodexStreamResult, model: &str) -> Response {
-    let mut sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), model);
-    stream_sse_transformed(stream_res.response.bytes_stream(), move |line| {
-        if let Some(parsed) = parse_codex_sse_line(line) {
-            codex_to_openai_sse(&parsed, &mut sse_state)
-        } else {
-            Vec::new()
-        }
-    })
+    let sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), model);
+    stream_sse_transformed(
+        stream_res.response.bytes_stream(),
+        sse_state,
+        move |line, state: &mut OpenAiStreamState| {
+            if let Some(parsed) = parse_codex_sse_line(line) {
+                codex_to_openai_sse(&parsed, state)
+            } else {
+                Vec::new()
+            }
+        },
+        None,
+    )
 }
 
 async fn handle_codex_completions_buffered(stream_res: CodexStreamResult, model: &str) -> Response {
@@ -1406,6 +1456,32 @@ mod tests {
             blocks[0].get("thinking").and_then(|v| v.as_str()),
             Some("cached reason")
         );
+    }
+
+    #[tokio::test]
+    async fn test_stream_end_hook_populates_completion_cache() {
+        use crate::utils::completion_cache::{lookup_completion, write_completion_cache};
+        use crate::utils::sse::OpenAiStreamState;
+        let key = format!("test-stream-hook-{}", std::process::id());
+        let mut state = OpenAiStreamState::new("chatcmpl-hook", "hook-model");
+        state.finished = true;
+        state.full_text = "hooked-reply".to_string();
+        state.finish_reason = Some("STOP".to_string());
+        let key_owned = key.clone();
+        let res = super::stream_sse_transformed(
+            futures::stream::iter(Vec::<Result<axum::body::Bytes, reqwest::Error>>::new()),
+            state,
+            |_line: &str, _state: &mut OpenAiStreamState| Vec::new(),
+            Some(Box::new(move |done: OpenAiStreamState| {
+                if let Some(entry) = crate::utils::completion_cache::gemini_stream_entry_from_openai(&done) {
+                    write_completion_cache(&key_owned, entry);
+                }
+            })),
+        );
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert!(bytes.is_empty());
+        let entry = lookup_completion(&key).expect("hook must populate the cache at stream end");
+        assert_eq!(entry.text, "hooked-reply");
     }
 
     #[tokio::test]

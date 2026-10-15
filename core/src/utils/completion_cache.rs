@@ -316,6 +316,61 @@ pub fn claude_completion_entry(response: &Value, model: &str, created: u64) -> O
     })
 }
 
+/// Build a completion entry from a finished `OpenAI`-protocol Gemini stream state.
+/// Returns `None` for unfinished or empty turns.
+#[must_use]
+pub fn gemini_stream_entry_from_openai(state: &crate::utils::sse::OpenAiStreamState) -> Option<CompletionEntry> {
+    if !state.finished {
+        return None;
+    }
+    gemini_completion_entry(
+        &crate::utils::sse::CollectedGemini {
+            text: state.full_text.clone(),
+            reasoning: state.reasoning.clone(),
+            function_calls: state.streamed_tools.clone(),
+            thought_signature: if state.thought_signature.is_empty() {
+                None
+            } else {
+                Some(state.thought_signature.clone())
+            },
+            finish_reason: state.finish_reason.clone(),
+            prompt_tokens: state.prompt_tokens,
+            output_tokens: state.output_tokens,
+        },
+        &state.model,
+        state.created,
+    )
+}
+
+/// Build a completion entry from a finished Anthropic-protocol Gemini stream state.
+/// Returns `None` for unfinished or empty turns.
+#[must_use]
+pub fn gemini_stream_entry_from_anthropic(
+    state: &crate::utils::sse::AnthropicStreamState,
+    created: u64,
+) -> Option<CompletionEntry> {
+    if !state.finished {
+        return None;
+    }
+    gemini_completion_entry(
+        &crate::utils::sse::CollectedGemini {
+            text: state.full_text.clone(),
+            reasoning: state.reasoning.clone(),
+            function_calls: state.streamed_tools.clone(),
+            thought_signature: if state.thought_signature.is_empty() {
+                None
+            } else {
+                Some(state.thought_signature.clone())
+            },
+            finish_reason: state.finish_reason.clone(),
+            prompt_tokens: state.input_tokens,
+            output_tokens: state.output_tokens,
+        },
+        &state.model,
+        created,
+    )
+}
+
 /// Fetch a fresh full response for a request key.
 #[must_use]
 pub fn lookup_completion(key: &str) -> Option<CompletionEntry> {
@@ -1355,6 +1410,32 @@ mod tests {
 
         let empty = serde_json::json!({ "content": [], "stop_reason": "end_turn" });
         assert!(claude_completion_entry(&empty, "c", 100).is_none());
+    }
+
+    #[test]
+    fn test_stream_entry_gate_and_shape() {
+        use super::{gemini_stream_entry_from_anthropic, gemini_stream_entry_from_openai};
+        use crate::utils::sse::{AnthropicStreamState, OpenAiStreamState};
+        let mut openai = OpenAiStreamState::new("chatcmpl-x", "m");
+        openai.full_text = "streamed text".to_string();
+        assert!(gemini_stream_entry_from_openai(&openai).is_none());
+        openai.finished = true;
+        openai.finish_reason = Some("MAX_TOKENS".to_string());
+        openai.prompt_tokens = 6;
+        openai.output_tokens = 2;
+        let entry = gemini_stream_entry_from_openai(&openai).unwrap();
+        assert_eq!(entry.text, "streamed text");
+        assert_eq!(entry.finish_reason.as_deref(), Some("MAX_TOKENS"));
+        assert_eq!(entry.usage.input_tokens, 6);
+        assert_eq!(entry.model, "m");
+
+        let mut anthropic = AnthropicStreamState::new("msg_x", "m");
+        assert!(gemini_stream_entry_from_anthropic(&anthropic, 77).is_none());
+        anthropic.finished = true;
+        anthropic.full_text = "hi".to_string();
+        let entry = gemini_stream_entry_from_anthropic(&anthropic, 77).unwrap();
+        assert_eq!(entry.created, 77);
+        assert_eq!(entry.text, "hi");
     }
 
     #[test]
