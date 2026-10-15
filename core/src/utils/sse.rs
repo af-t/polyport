@@ -380,23 +380,50 @@ fn gemini_part_to_openai(part: &Value, state: &mut OpenAiStreamState) -> Vec<Str
         part,
     );
     if let Some(text) = part.get("text").and_then(Value::as_str) {
-        if part.get("thought").and_then(Value::as_bool) != Some(true) {
+        let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
+        if is_thought {
+            if !state.reasoning_excluded {
+                let fmt = reasoning_format_for(&state.model);
+                let reasoning_chunk = serde_json::json!({
+                    "id": &state.completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": state.created,
+                    "model": &state.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "reasoning": text,
+                            "reasoning_content": text,
+                            "reasoning_details": [{
+                                "type": "reasoning.text",
+                                "id": serde_json::Value::Null,
+                                "text": text,
+                                "format": fmt,
+                                "index": 0
+                            }]
+                        },
+                        "finish_reason": serde_json::Value::Null
+                    }]
+                });
+                events.push(format!("data: {reasoning_chunk}\n\n"));
+            }
+        } else {
             state.full_text.push_str(text);
+            let text_chunk = serde_json::json!({
+                "id": &state.completion_id,
+                "object": "chat.completion.chunk",
+                "created": state.created,
+                "model": &state.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": text
+                    },
+                    "finish_reason": serde_json::Value::Null
+                }]
+            });
+            events.push(format!("data: {text_chunk}\n\n"));
         }
-        let text_chunk = serde_json::json!({
-            "id": &state.completion_id,
-            "object": "chat.completion.chunk",
-            "created": state.created,
-            "model": &state.model,
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "content": text
-                },
-                "finish_reason": serde_json::Value::Null
-            }]
-        });
-        events.push(format!("data: {text_chunk}\n\n"));
     }
 
     if let Some(fc) = part.get("functionCall") {
@@ -1213,6 +1240,32 @@ mod tests {
         let all_text = events.join("\n");
         assert!(all_text.contains("chat.completion.chunk"));
         assert!(all_text.contains("[DONE]"));
+    }
+
+    #[test]
+    fn test_gemini_to_openai_sse_emits_reasoning_for_thought_parts() {
+        let mut state = OpenAiStreamState::new("test-cmpl-thought", "gemini-3.8-flash");
+        let chunk = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "parts": [
+                            { "text": "let me think about this", "thought": true },
+                            { "text": "here is the answer", "thought": false }
+                        ]
+                    }
+                }]
+            }
+        });
+
+        let events = gemini_to_openai_sse(&chunk, &mut state);
+        let joined = events.join("\n");
+        // Verify that thought is emitted with reasoning delta, NOT content delta
+        assert!(joined.contains("\"reasoning\":\"let me think about this\""));
+        assert!(joined.contains("\"reasoning_content\":\"let me think about this\""));
+        assert!(joined.contains("\"reasoning_details\":"));
+        // Verify answer text is emitted as normal content
+        assert!(joined.contains("\"content\":\"here is the answer\""));
     }
 
     #[test]

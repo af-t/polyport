@@ -8,9 +8,9 @@ rust-version = "1.89.0"
 tokio = { version = "1.53", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 reqwest = { version = "0.13", features = ["json", "stream", "rustls"] }
-tokio-tungstenite = "0.30"
+tokio-tungstenite = "0.29"
 tower = "0.5"
-tower-http = { version = "0.7", features = ["trace", "timeout", "compression-full"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "compression-full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures = "0.3"
