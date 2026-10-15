@@ -1254,6 +1254,100 @@ fn collect_ddg_topics<'a>(node: &'a serde_json::Value, out: &mut Vec<(&'a str, &
     out.push((text, url));
 }
 
+fn unescape_html_entities(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        if ch == '<' {
+            in_tag = true;
+        } else if ch == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn extract_ddg_target_url(raw_href: &str) -> String {
+    let href = if let Some(stripped) = raw_href.strip_prefix("//") {
+        format!("https://{stripped}")
+    } else {
+        raw_href.to_string()
+    };
+    if let Ok(parsed) = reqwest::Url::parse(&href) {
+        for (k, v) in parsed.query_pairs() {
+            if k == "uddg" {
+                return v.to_string();
+            }
+        }
+    }
+    raw_href.to_string()
+}
+
+fn parse_ddg_html_results(html: &str, max_results: usize) -> String {
+    let mut lines = Vec::new();
+    let snippet_marker = "class=\"result__snippet\"";
+    let mut search_pos = 0;
+    while let Some(marker_idx) = html[search_pos..].find(snippet_marker) {
+        let abs_marker = search_pos + marker_idx;
+        let Some(a_start) = html[..abs_marker].rfind("<a") else {
+            search_pos = abs_marker + snippet_marker.len();
+            continue;
+        };
+        let Some(tag_end_offset) = html[abs_marker..].find('>') else {
+            break;
+        };
+        let tag_end = abs_marker + tag_end_offset;
+        let Some(closing_a_offset) = html[tag_end..].find("</a>") else {
+            break;
+        };
+        let closing_a = tag_end + closing_a_offset;
+
+        let a_tag_str = &html[a_start..tag_end];
+        let mut href = String::new();
+        if let Some(href_idx) = a_tag_str.find("href=\"") {
+            let val_start = href_idx + 6;
+            if let Some(val_end) = a_tag_str[val_start..].find('"') {
+                href = a_tag_str[val_start..val_start + val_end].to_string();
+            }
+        }
+
+        let inner_snippet = &html[tag_end + 1..closing_a];
+        let stripped = strip_html_tags(inner_snippet);
+        let unescaped = unescape_html_entities(&stripped);
+        let text = unescaped.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !text.is_empty() {
+            let target_url = extract_ddg_target_url(&href);
+            if target_url.is_empty() || target_url == href {
+                lines.push(text);
+            } else {
+                lines.push(format!("{text} ({target_url})"));
+            }
+            if lines.len() >= max_results {
+                break;
+            }
+        }
+        search_pos = closing_a + 4;
+    }
+
+    if lines.is_empty() {
+        "no results".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 fn format_ddg_results(data: &serde_json::Value, max_results: usize) -> String {
     let mut lines: Vec<String> = Vec::new();
     let abstract_text = data
@@ -1304,13 +1398,51 @@ async fn exec_search_web(input: &serde_json::Value, ctx: &ToolCtx) -> Result<Str
         .and_then(num_value)
         .map_or(DEFAULT_SEARCH_RESULTS, to_usize)
         .min(MAX_SEARCH_RESULTS);
+
+    let html_url = match reqwest::Url::parse("https://html.duckduckgo.com/html/") {
+        Ok(u) => u,
+        Err(err) => return Err(ToolError::Failed(err.to_string())),
+    };
+    check_url_allowed(&html_url, ctx).await?;
+
+    let timeout = Duration::from_secs(ctx.fetch_timeout_secs);
+    let post_fut = async {
+        let mut dummy = reqwest::Url::parse("https://dummy.local").map_err(|err| ToolError::Failed(err.to_string()))?;
+        dummy.query_pairs_mut().append_pair("q", query);
+        let form_body = dummy.query().unwrap_or("").to_string();
+        let resp = ctx
+            .http
+            .post("https://html.duckduckgo.com/html/")
+            .header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(form_body)
+            .send()
+            .await
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        let status = resp.status();
+        let (bytes, _) = read_body_capped(resp, ctx.fetch_max_bytes).await?;
+        Ok::<_, ToolError>((status, bytes))
+    };
+
+    if let Ok(Ok((status, bytes))) = tokio::time::timeout(timeout, post_fut).await
+        && status.is_success()
+    {
+        let html_text = String::from_utf8_lossy(&bytes);
+        let parsed = parse_ddg_html_results(&html_text, max_results);
+        if parsed != "no results" {
+            return Ok(parsed);
+        }
+    }
+
     let mut endpoint =
         reqwest::Url::parse("https://api.duckduckgo.com/").map_err(|err| ToolError::Failed(err.to_string()))?;
     endpoint
         .query_pairs_mut()
         .append_pair("q", query)
         .append_pair("format", "json");
-    let timeout = Duration::from_secs(ctx.fetch_timeout_secs);
     let (status, body, _) = match tokio::time::timeout(timeout, fetch_bytes_capped(endpoint.as_str(), ctx)).await {
         Ok(result) => result?,
         Err(_) => {
@@ -2562,5 +2694,49 @@ mod tests {
         assert_eq!(format_ddg_results(&empty, 5), "no results");
         let missing = serde_json::json!({});
         assert_eq!(format_ddg_results(&missing, 5), "no results");
+    }
+
+    #[test]
+    fn test_parse_ddg_html_results_snippets_and_urls() {
+        let sample_html = r#"
+        <!DOCTYPE html><html><body>
+        <div class="result">
+          <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fai.google.dev%2Fgemini-3.8-flash&rut=xyz">
+            <b>Gemini 3.8 Flash</b> is an advanced model &amp; tool.
+          </a>
+        </div>
+        <div class="result">
+          <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdeepmind.google%2Fmodels&rut=abc">
+            Documentation on <i>Flash</i> &quot;architecture&quot;.
+          </a>
+        </div>
+        </body></html>
+        "#;
+        let out = parse_ddg_html_results(sample_html, 5);
+        assert_eq!(
+            out,
+            "Gemini 3.8 Flash is an advanced model & tool. (https://ai.google.dev/gemini-3.8-flash)\n\
+             Documentation on Flash \"architecture\". (https://deepmind.google/models)"
+        );
+
+        let capped = parse_ddg_html_results(sample_html, 1);
+        assert_eq!(
+            capped,
+            "Gemini 3.8 Flash is an advanced model & tool. (https://ai.google.dev/gemini-3.8-flash)"
+        );
+
+        let empty = parse_ddg_html_results("<html><body>No snippets here</body></html>", 5);
+        assert_eq!(empty, "no results");
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_search_web_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::test_in(&dir);
+        let res = execute_tool("searchWeb", &json!({"query": "rust lang", "maxResults": 3}), &ctx)
+            .await
+            .expect("live web search must succeed");
+        assert_ne!(res, "no results");
+        assert!(res.to_lowercase().contains("rust"), "result should mention rust: {res}");
     }
 }
