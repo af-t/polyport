@@ -371,7 +371,8 @@ pub fn gemini_stream_entry_from_anthropic(
     )
 }
 
-fn codex_usage(usage: Option<&Value>) -> CompletionUsage {
+#[must_use]
+pub fn codex_usage(usage: Option<&Value>) -> CompletionUsage {
     let usage = usage.unwrap_or(&Value::Null);
     let cached = usage
         .get("input_tokens_details")
@@ -1551,6 +1552,55 @@ mod tests {
         let tc = entry.tool_calls.unwrap();
         assert_eq!(tc[0].id, "call_ab");
         assert_eq!(tc[0].arguments, "{\"c\":\"ls\"}");
+    }
+
+    #[test]
+    fn test_codex_collected_populates_and_replays_tool_turn() {
+        use super::{
+            codex_completion_entry, lookup_completion, replay_completions_json, replay_messages_json,
+            write_completion_cache,
+        };
+        use crate::utils::sse::collect_codex_response;
+        let frames = [
+            serde_json::json!({ "type": "response.output_text.delta", "delta": "I will check." }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": { "type": "function_call", "id": "f1", "call_id": "call_1", "name": "get_weather", "arguments": "{\"loc\":\"Tokyo\"}" }
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": { "usage": { "input_tokens": 50, "output_tokens": 20 } }
+            }),
+        ];
+        let collected = collect_codex_response(&frames);
+        let entry = codex_completion_entry(&collected.text, &collected.acc, "gpt-5.6-luna", 0, collected.finished)
+            .expect("turn must build completion entry");
+        let key = format!("codex-buffered-test-{}", std::process::id());
+        write_completion_cache(&key, entry);
+
+        let cached = lookup_completion(&key).expect("cached entry must exist");
+        assert_eq!(cached.text, "I will check.");
+        assert_eq!(cached.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(cached.tool_calls.as_ref().map(Vec::len), Some(1));
+
+        let openai_json = replay_completions_json(&cached, "openai-codex-v1", false);
+        assert_eq!(openai_json["choices"][0]["finish_reason"], "tool_calls");
+        let tc = &openai_json["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_1");
+        assert_eq!(tc["function"]["name"], "get_weather");
+        assert_eq!(tc["function"]["arguments"], "{\"loc\":\"Tokyo\"}");
+
+        let anthropic_json = replay_messages_json(&cached, false);
+        assert_eq!(anthropic_json["stop_reason"], "tool_use");
+        let tool_block = anthropic_json["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .expect("anthropic replay must have tool_use block");
+        assert_eq!(tool_block["id"], "call_1");
+        assert_eq!(tool_block["name"], "get_weather");
+        assert_eq!(tool_block["input"]["loc"], "Tokyo");
     }
 
     #[test]

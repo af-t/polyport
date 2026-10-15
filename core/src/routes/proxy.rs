@@ -426,10 +426,69 @@ fn handle_codex_messages_stream(
     )
 }
 
-async fn handle_codex_messages_buffered(stream_res: CodexStreamResult, model: &str) -> Response {
+async fn handle_codex_messages_buffered(
+    stream_res: CodexStreamResult,
+    model: &str,
+    cache_key: &str,
+    show_thinking: bool,
+) -> Response {
     let full_body = stream_res.response.text().await.unwrap_or_default();
     let chunks: Vec<Value> = full_body.lines().filter_map(parse_codex_sse_line).collect();
-    let (full_text, _finish_reason, prompt_tokens, output_tokens) = collect_codex_response(&chunks);
+    let collected = collect_codex_response(&chunks);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if let Some(entry) = crate::utils::completion_cache::codex_completion_entry(
+        &collected.text,
+        &collected.acc,
+        model,
+        now,
+        collected.finished,
+    ) {
+        crate::utils::completion_cache::write_completion_cache(cache_key, entry);
+    }
+
+    let token = if collected.acc.encrypted.is_empty() {
+        String::new()
+    } else {
+        mint_reasoning_token(
+            &serde_json::to_string(&collected.acc.encrypted).unwrap_or_default(),
+            &collected.acc.reasoning,
+        )
+    };
+
+    let mut content = Vec::new();
+    if show_thinking && !collected.acc.reasoning.is_empty() {
+        let mut thinking_block = serde_json::json!({
+            "type": "thinking",
+            "thinking": collected.acc.reasoning,
+        });
+        if !token.is_empty() {
+            thinking_block["signature"] = Value::String(token.clone());
+        }
+        content.push(thinking_block);
+    }
+    if !collected.text.is_empty() {
+        content.push(serde_json::json!({ "type": "text", "text": collected.text }));
+    }
+    for tool in &collected.acc.tools {
+        let parsed: Value = serde_json::from_str(&tool.args).unwrap_or(serde_json::json!({}));
+        content.push(serde_json::json!({
+            "type": "tool_use",
+            "id": tool.id,
+            "name": tool.name,
+            "input": parsed,
+        }));
+    }
+
+    let stop_reason = if collected.acc.tools.is_empty() {
+        "end_turn"
+    } else {
+        "tool_use"
+    };
+    let usage = crate::utils::completion_cache::codex_usage(collected.acc.usage.as_ref());
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -437,13 +496,10 @@ async fn handle_codex_messages_buffered(stream_res: CodexStreamResult, model: &s
             "type": "message",
             "role": "assistant",
             "model": model,
-            "content": [{ "type": "text", "text": full_text }],
-            "stop_reason": "end_turn",
+            "content": content,
+            "stop_reason": stop_reason,
             "stop_sequence": serde_json::Value::Null,
-            "usage": {
-                "input_tokens": prompt_tokens,
-                "output_tokens": output_tokens
-            }
+            "usage": crate::utils::completion_cache::anthropic_usage_value(&usage)
         })),
     )
         .into_response()
@@ -501,14 +557,14 @@ async fn dispatch_codex_messages(
                 let mut guard = state.pool.write().await;
                 guard.record_account_pin(Provider::Codex, lookup_keys, Some(&stream_res.account_id));
             }
+            let show_thinking = req
+                .thinking
+                .as_ref()
+                .is_some_and(|t| t.get("type").and_then(Value::as_str) != Some("disabled"));
             if req.stream.unwrap_or(false) {
-                let show_thinking = req
-                    .thinking
-                    .as_ref()
-                    .is_some_and(|t| t.get("type").and_then(Value::as_str) != Some("disabled"));
                 handle_codex_messages_stream(stream_res, model_name, cache_key, show_thinking)
             } else {
-                handle_codex_messages_buffered(stream_res, model_name).await
+                handle_codex_messages_buffered(stream_res, model_name, cache_key, show_thinking).await
             }
         }
         Err(err) => attempt_error_to_response(&err),
@@ -1082,13 +1138,86 @@ fn handle_codex_completions_stream(
     )
 }
 
-async fn handle_codex_completions_buffered(stream_res: CodexStreamResult, model: &str) -> Response {
+async fn handle_codex_completions_buffered(
+    stream_res: CodexStreamResult,
+    model: &str,
+    cache_key: &str,
+    reasoning_excluded: bool,
+) -> Response {
     let full_body = stream_res.response.text().await.unwrap_or_default();
     let chunks: Vec<Value> = full_body.lines().filter_map(parse_codex_sse_line).collect();
-    let (full_text, _finish_reason, prompt_tokens, output_tokens) = collect_codex_response(&chunks);
+    let collected = collect_codex_response(&chunks);
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    if let Some(entry) = crate::utils::completion_cache::codex_completion_entry(
+        &collected.text,
+        &collected.acc,
+        model,
+        now,
+        collected.finished,
+    ) {
+        crate::utils::completion_cache::write_completion_cache(cache_key, entry);
+    }
+
+    let token = if collected.acc.encrypted.is_empty() {
+        String::new()
+    } else {
+        mint_reasoning_token(
+            &serde_json::to_string(&collected.acc.encrypted).unwrap_or_default(),
+            &collected.acc.reasoning,
+        )
+    };
+
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": if collected.text.is_empty() { Value::Null } else { Value::String(collected.text) },
+    });
+    if !reasoning_excluded && !collected.acc.reasoning.is_empty() {
+        message["reasoning"] = Value::String(collected.acc.reasoning.clone());
+        message["reasoning_content"] = Value::String(collected.acc.reasoning.clone());
+    }
+    if !reasoning_excluded && (!collected.acc.reasoning.is_empty() || !token.is_empty()) {
+        let mut entry = serde_json::json!({
+            "type": "reasoning.text",
+            "id": Value::Null,
+            "text": collected.acc.reasoning,
+            "format": reasoning_format_for(model),
+            "index": 0,
+        });
+        if !token.is_empty() {
+            entry["signature"] = Value::String(token);
+        }
+        message["reasoning_details"] = Value::Array(vec![entry]);
+    }
+    if !collected.acc.tools.is_empty() {
+        message["tool_calls"] = Value::Array(
+            collected
+                .acc
+                .tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "id": t.id,
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "arguments": t.args,
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+
+    let finish_reason = if collected.acc.tools.is_empty() {
+        "stop"
+    } else {
+        "tool_calls"
+    };
+    let usage = crate::utils::completion_cache::codex_usage(collected.acc.usage.as_ref());
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1098,14 +1227,10 @@ async fn handle_codex_completions_buffered(stream_res: CodexStreamResult, model:
             "model": model,
             "choices": [{
                 "index": 0,
-                "message": { "role": "assistant", "content": full_text },
-                "finish_reason": "stop"
+                "message": message,
+                "finish_reason": finish_reason,
             }],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": output_tokens,
-                "total_tokens": prompt_tokens + output_tokens
-            }
+            "usage": crate::utils::completion_cache::openai_usage_value(&usage)
         })),
     )
         .into_response()
@@ -1178,7 +1303,13 @@ async fn dispatch_codex_completions(
                     want_usage,
                 )
             } else {
-                handle_codex_completions_buffered(stream_res, model_name).await
+                handle_codex_completions_buffered(
+                    stream_res,
+                    model_name,
+                    cache_key,
+                    reasoning_excluded(req.reasoning.as_ref()),
+                )
+                .await
             }
         }
         Err(err) => attempt_error_to_response(&err),

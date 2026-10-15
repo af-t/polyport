@@ -1120,33 +1120,41 @@ pub fn codex_to_anthropic_sse(chunk: &Value, state: &mut AnthropicStreamState) -
     events
 }
 
-#[must_use]
-pub fn collect_codex_response(chunks: &[Value]) -> (String, Option<String>, u32, u32) {
-    let mut full_text = String::new();
-    let mut input_tokens = 0;
-    let mut output_tokens = 0;
+#[derive(Debug, Clone, Default)]
+pub struct CollectedCodex {
+    pub text: String,
+    pub acc: CodexAccumulator,
+    pub finish_reason: String,
+    pub finished: bool,
+}
 
+#[must_use]
+pub fn collect_codex_accumulator(chunks: &[Value]) -> CollectedCodex {
+    let mut acc = CodexAccumulator::default();
+    let mut text = String::new();
+    let mut finished = false;
     for chunk in chunks {
-        let chunk_type = chunk.get("type").and_then(Value::as_str).unwrap_or("");
-        if chunk_type == "response.output_text.delta" {
-            if let Some(t) = chunk.get("delta").and_then(Value::as_str) {
-                full_text.push_str(t);
-            }
-        } else if chunk_type == "response.completed" {
-            let usage_opt = chunk.get("response").and_then(|r| r.get("usage"));
-            if let Some(usage) = usage_opt {
-                input_tokens = usage
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .map_or(0, |v| u32::try_from(v).unwrap_or(0));
-                output_tokens = usage
-                    .get("output_tokens")
-                    .and_then(Value::as_u64)
-                    .map_or(0, |v| u32::try_from(v).unwrap_or(0));
-            }
+        accumulate_codex_frame(&mut acc, &mut text, chunk);
+        if chunk.get("type").and_then(Value::as_str) == Some("response.completed") {
+            finished = true;
         }
     }
-    (full_text, Some("stop".to_string()), input_tokens, output_tokens)
+    let finish_reason = if acc.tools.is_empty() {
+        "stop".to_string()
+    } else {
+        "tool_calls".to_string()
+    };
+    CollectedCodex {
+        text,
+        acc,
+        finish_reason,
+        finished,
+    }
+}
+
+#[must_use]
+pub fn collect_codex_response(chunks: &[Value]) -> CollectedCodex {
+    collect_codex_accumulator(chunks)
 }
 
 #[cfg(test)]
@@ -1280,6 +1288,56 @@ mod tests {
                 .and_then(Value::as_u64),
             Some(30)
         );
+    }
+
+    #[test]
+    fn test_collect_codex_response_captures_all_facets() {
+        let frames = [
+            serde_json::json!({ "type": "response.output_text.delta", "delta": "hello " }),
+            serde_json::json!({ "type": "response.output_text.delta", "delta": "world" }),
+            serde_json::json!({ "type": "response.reasoning_summary_text.delta", "delta": "thinking deeply" }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "item": { "type": "function_call", "id": "fc1", "call_id": "call_abc", "name": "get_weather" }
+            }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc1",
+                "delta": "{\"city\":\"Jakarta\"}"
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": { "type": "function_call", "id": "fc1", "call_id": "call_abc", "name": "get_weather", "arguments": "{\"city\":\"Jakarta\"}" }
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": { "type": "reasoning", "encrypted_content": "enc_blob_123" }
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "usage": {
+                        "input_tokens": 42,
+                        "output_tokens": 15,
+                        "input_tokens_details": { "cached_tokens": 10 },
+                        "output_tokens_details": { "reasoning_tokens": 8 }
+                    }
+                }
+            }),
+        ];
+        let collected = collect_codex_response(&frames);
+        assert_eq!(collected.text, "hello world");
+        assert_eq!(collected.acc.reasoning, "thinking deeply");
+        assert_eq!(collected.acc.tools.len(), 1);
+        assert_eq!(collected.acc.tools[0].id, "call_abc");
+        assert_eq!(collected.acc.tools[0].name, "get_weather");
+        assert_eq!(collected.acc.tools[0].args, "{\"city\":\"Jakarta\"}");
+        assert_eq!(collected.acc.encrypted, vec!["enc_blob_123".to_string()]);
+        assert_eq!(collected.finish_reason, "tool_calls");
+        assert!(collected.finished);
+        let usage = collected.acc.usage.as_ref().unwrap();
+        assert_eq!(usage.get("input_tokens").and_then(Value::as_u64), Some(42));
+        assert_eq!(usage.get("output_tokens").and_then(Value::as_u64), Some(15));
     }
 
     #[test]
