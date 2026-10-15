@@ -762,10 +762,12 @@ fn handle_gemini_completions_stream(
     history_key: &str,
     reasoning_excluded: bool,
     cache_key: &str,
+    want_usage: bool,
 ) -> Response {
     let mut sse_state = OpenAiStreamState::new(&format!("chatcmpl-{}", uuid::Uuid::new_v4()), model);
     sse_state.history_key = history_key.to_string();
     sse_state.reasoning_excluded = reasoning_excluded;
+    sse_state.want_usage = want_usage;
     let cache_key = cache_key.to_string();
     stream_sse_transformed(
         stream_res.response.bytes_stream(),
@@ -864,6 +866,13 @@ async fn handle_gemini_completions_buffered(
                 "prompt_tokens": res.prompt_tokens,
                 "completion_tokens": res.output_tokens,
                 "total_tokens": res.prompt_tokens + res.output_tokens,
+                "prompt_tokens_details": { "cached_tokens": 0, "audio_tokens": 0 },
+                "completion_tokens_details": {
+                    "reasoning_tokens": res.reasoning_tokens,
+                    "audio_tokens": 0,
+                    "accepted_prediction_tokens": 0,
+                    "rejected_prediction_tokens": 0
+                }
             }
         })),
     )
@@ -939,7 +948,13 @@ async fn dispatch_gemini_completions(
                 guard.record_account_pin(Provider::Gemini, lookup_keys, Some(&stream_res.account_id));
             }
             if req.stream.unwrap_or(false) {
-                handle_gemini_completions_stream(stream_res, model_name, &history_key, excluded, cache_key)
+                let want_usage = req
+                    .stream_options
+                    .as_ref()
+                    .and_then(|o| o.get("include_usage"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                handle_gemini_completions_stream(stream_res, model_name, &history_key, excluded, cache_key, want_usage)
             } else {
                 handle_gemini_completions_buffered(stream_res, model_name, &history_key, excluded, cache_key).await
             }

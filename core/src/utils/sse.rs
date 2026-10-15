@@ -45,6 +45,7 @@ pub struct AnthropicStreamState {
     pub codex: CodexAccumulator,
     pub show_thinking: bool,
     pub open_block: Option<(CodexBlock, usize)>,
+    pub reasoning_tokens: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +76,7 @@ impl AnthropicStreamState {
             codex: CodexAccumulator::default(),
             show_thinking: false,
             open_block: None,
+            reasoning_tokens: 0,
         }
     }
 }
@@ -199,9 +201,18 @@ pub fn gemini_to_anthropic_sse(chunk: &Value, state: &mut AnthropicStreamState) 
         if let Some(prompt) = usage.get("promptTokenCount").and_then(Value::as_u64) {
             state.input_tokens = u32::try_from(prompt).unwrap_or(0);
         }
-        if let Some(cand) = usage.get("candidatesTokenCount").and_then(Value::as_u64) {
-            state.output_tokens = u32::try_from(cand).unwrap_or(0);
-        }
+        let candidates = usage
+            .get("candidatesTokenCount")
+            .and_then(Value::as_u64)
+            .and_then(|c| u32::try_from(c).ok())
+            .unwrap_or(0);
+        let thoughts = usage
+            .get("thoughtsTokenCount")
+            .and_then(Value::as_u64)
+            .and_then(|t| u32::try_from(t).ok())
+            .unwrap_or(0);
+        state.reasoning_tokens = thoughts;
+        state.output_tokens = candidates + thoughts;
     }
 
     if !state.started {
@@ -288,6 +299,7 @@ pub struct OpenAiStreamState {
     pub finish_reason: Option<String>,
     pub prompt_tokens: u32,
     pub output_tokens: u32,
+    pub reasoning_tokens: u32,
     pub codex: CodexAccumulator,
     pub want_usage: bool,
 }
@@ -314,6 +326,7 @@ impl OpenAiStreamState {
             finish_reason: None,
             prompt_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: 0,
             codex: CodexAccumulator::default(),
             want_usage: true,
         }
@@ -469,9 +482,18 @@ pub fn gemini_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec
         if let Some(prompt) = usage.get("promptTokenCount").and_then(Value::as_u64) {
             state.prompt_tokens = u32::try_from(prompt).unwrap_or(0);
         }
-        if let Some(cand) = usage.get("candidatesTokenCount").and_then(Value::as_u64) {
-            state.output_tokens = u32::try_from(cand).unwrap_or(0);
-        }
+        let candidates = usage
+            .get("candidatesTokenCount")
+            .and_then(Value::as_u64)
+            .and_then(|c| u32::try_from(c).ok())
+            .unwrap_or(0);
+        let thoughts = usage
+            .get("thoughtsTokenCount")
+            .and_then(Value::as_u64)
+            .and_then(|t| u32::try_from(t).ok())
+            .unwrap_or(0);
+        state.reasoning_tokens = thoughts;
+        state.output_tokens = candidates + thoughts;
     }
 
     if !state.started {
@@ -521,13 +543,6 @@ pub fn gemini_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec
 }
 
 fn finish_openai_gemini_turn(state: &OpenAiStreamState, events: &mut Vec<String>) {
-    if !state.reasoning_excluded {
-        let token = crate::utils::history_cache::mint_reasoning_token(&state.thought_signature, &state.reasoning);
-        if let Some(sig_chunk) = reasoning_details_chunk(&state.completion_id, state.created, &state.model, "", &token)
-        {
-            events.push(format!("data: {sig_chunk}\n\n"));
-        }
-    }
     let final_chunk = serde_json::json!({
         "id": &state.completion_id,
         "object": "chat.completion.chunk",
@@ -540,6 +555,35 @@ fn finish_openai_gemini_turn(state: &OpenAiStreamState, events: &mut Vec<String>
         }]
     });
     events.push(format!("data: {final_chunk}\n\n"));
+    if !state.reasoning_excluded {
+        let token = crate::utils::history_cache::mint_reasoning_token(&state.thought_signature, &state.reasoning);
+        if let Some(sig_chunk) = reasoning_details_chunk(&state.completion_id, state.created, &state.model, "", &token)
+        {
+            events.push(format!("data: {sig_chunk}\n\n"));
+        }
+    }
+    if state.want_usage {
+        let usage_chunk = serde_json::json!({
+            "id": &state.completion_id,
+            "object": "chat.completion.chunk",
+            "created": state.created,
+            "model": &state.model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": state.prompt_tokens,
+                "completion_tokens": state.output_tokens,
+                "total_tokens": state.prompt_tokens + state.output_tokens,
+                "prompt_tokens_details": { "cached_tokens": 0, "audio_tokens": 0 },
+                "completion_tokens_details": {
+                    "reasoning_tokens": state.reasoning_tokens,
+                    "audio_tokens": 0,
+                    "accepted_prediction_tokens": 0,
+                    "rejected_prediction_tokens": 0
+                }
+            }
+        });
+        events.push(format!("data: {usage_chunk}\n\n"));
+    }
     events.push("data: [DONE]\n\n".to_string());
 }
 
@@ -732,6 +776,7 @@ pub struct CollectedGemini {
     pub finish_reason: Option<String>,
     pub prompt_tokens: u32,
     pub output_tokens: u32,
+    pub reasoning_tokens: u32,
 }
 
 #[must_use]
@@ -743,15 +788,25 @@ pub fn collect_gemini_response(chunks: &[Value]) -> CollectedGemini {
     let mut finish_reason = None;
     let mut prompt_tokens = 0;
     let mut output_tokens = 0;
+    let mut reasoning_tokens = 0;
 
     for chunk in chunks {
         if let Some(usage) = chunk.get("response").and_then(|r| r.get("usageMetadata")) {
             if let Some(p) = usage.get("promptTokenCount").and_then(Value::as_u64) {
                 prompt_tokens = u32::try_from(p).unwrap_or(0);
             }
-            if let Some(c) = usage.get("candidatesTokenCount").and_then(Value::as_u64) {
-                output_tokens = u32::try_from(c).unwrap_or(0);
-            }
+            let candidates = usage
+                .get("candidatesTokenCount")
+                .and_then(Value::as_u64)
+                .and_then(|c| u32::try_from(c).ok())
+                .unwrap_or(0);
+            let thoughts = usage
+                .get("thoughtsTokenCount")
+                .and_then(Value::as_u64)
+                .and_then(|t| u32::try_from(t).ok())
+                .unwrap_or(0);
+            reasoning_tokens = thoughts;
+            output_tokens = candidates + thoughts;
         }
 
         let candidate = chunk
@@ -805,6 +860,7 @@ pub fn collect_gemini_response(chunks: &[Value]) -> CollectedGemini {
         finish_reason,
         prompt_tokens,
         output_tokens,
+        reasoning_tokens,
     }
 }
 
@@ -1467,7 +1523,8 @@ mod tests {
                 }],
                 "usageMetadata": {
                     "promptTokenCount": 5,
-                    "candidatesTokenCount": 2
+                    "candidatesTokenCount": 2,
+                    "thoughtsTokenCount": 7
                 }
             }
         });
@@ -1476,7 +1533,8 @@ mod tests {
         assert_eq!(res.text, "foo bar");
         assert_eq!(res.finish_reason.as_deref(), Some("STOP"));
         assert_eq!(res.prompt_tokens, 5);
-        assert_eq!(res.output_tokens, 2);
+        assert_eq!(res.output_tokens, 9);
+        assert_eq!(res.reasoning_tokens, 7);
     }
 
     #[test]

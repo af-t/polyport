@@ -245,7 +245,7 @@ pub fn gemini_completion_entry(
             output_tokens: u64::from(collected.output_tokens),
             cache_read_tokens: 0,
             cache_write_tokens: 0,
-            reasoning_tokens: 0,
+            reasoning_tokens: u64::from(collected.reasoning_tokens),
         },
         model: model.to_string(),
         created,
@@ -336,6 +336,7 @@ pub fn gemini_stream_entry_from_openai(state: &crate::utils::sse::OpenAiStreamSt
             finish_reason: state.finish_reason.clone(),
             prompt_tokens: state.prompt_tokens,
             output_tokens: state.output_tokens,
+            reasoning_tokens: state.reasoning_tokens,
         },
         &state.model,
         state.created,
@@ -365,6 +366,7 @@ pub fn gemini_stream_entry_from_anthropic(
             finish_reason: state.finish_reason.clone(),
             prompt_tokens: state.input_tokens,
             output_tokens: state.output_tokens,
+            reasoning_tokens: state.reasoning_tokens,
         },
         &state.model,
         created,
@@ -1433,6 +1435,7 @@ mod tests {
             finish_reason: None,
             prompt_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: 0,
         };
         assert!(gemini_completion_entry(&empty, "m", 99).is_none());
         let full = CollectedGemini {
@@ -1446,6 +1449,7 @@ mod tests {
             finish_reason: Some("STOP".to_string()),
             prompt_tokens: 11,
             output_tokens: 7,
+            reasoning_tokens: 3,
         };
         let entry = gemini_completion_entry(&full, "m", 99).unwrap();
         assert_eq!(entry.text, "hi");
