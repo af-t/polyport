@@ -19,6 +19,7 @@ use crate::services::anthropic::{
 use crate::services::codex::{CallCodexParams, CodexStreamResult, call_codex_stream};
 use crate::services::gemini::{CallGeminiParams, GeminiStreamResult, build_generation_config, call_gemini_stream};
 use crate::types::{ModelClass, Provider};
+use crate::utils::history_cache::record_tool_signature;
 use crate::utils::sse::{
     AnthropicStreamState, OpenAiStreamState, anthropic_to_openai_sse, codex_to_anthropic_sse, codex_to_openai_sse,
     collect_codex_response, collect_gemini_response, gemini_to_anthropic_sse, gemini_to_openai_sse,
@@ -126,9 +127,13 @@ async fn handle_gemini_messages_buffered(stream_res: GeminiStreamResult, model: 
     if !res.function_calls.is_empty() {
         stop_reason = "tool_use".to_string();
         for fc in res.function_calls {
+            let tool_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+            if let Some(sig) = res.thought_signature.as_deref() {
+                record_tool_signature(&tool_id, sig, "");
+            }
             content.push(serde_json::json!({
                 "type": "tool_use",
-                "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
+                "id": tool_id,
                 "name": fc.name,
                 "input": fc.args,
             }));
@@ -473,8 +478,12 @@ async fn handle_gemini_completions_buffered(stream_res: GeminiStreamResult, mode
             .function_calls
             .iter()
             .map(|fc| {
+                let tool_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                if let Some(sig) = res.thought_signature.as_deref() {
+                    record_tool_signature(&tool_id, sig, "");
+                }
                 serde_json::json!({
-                    "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
+                    "id": tool_id,
                     "type": "function",
                     "function": {
                         "name": fc.name,

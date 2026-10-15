@@ -32,6 +32,8 @@ pub struct AnthropicStreamState {
     pub finished: bool,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub thought_signature: String,
+    pub tool_ids: Vec<String>,
 }
 
 impl AnthropicStreamState {
@@ -46,8 +48,32 @@ impl AnthropicStreamState {
             finished: false,
             input_tokens: 0,
             output_tokens: 0,
+            thought_signature: String::new(),
+            tool_ids: Vec::new(),
         }
     }
+}
+
+fn part_signature(part: &Value) -> Option<&str> {
+    part.get("thoughtSignature")
+        .or_else(|| part.get("thought_signature"))
+        .and_then(Value::as_str)
+}
+
+fn note_part_signature(state_sig: &mut String, tool_ids: &[String], part: &Value) {
+    if let Some(sig) = part_signature(part)
+        && !sig.is_empty()
+    {
+        *state_sig = sig.to_string();
+        for id in tool_ids {
+            crate::utils::history_cache::record_tool_signature(id, sig, "");
+        }
+    }
+}
+
+fn note_tool_call(state_sig: &str, tool_ids: &mut Vec<String>, tool_id: &str) {
+    tool_ids.push(tool_id.to_string());
+    crate::utils::history_cache::record_tool_signature(tool_id, state_sig, "");
 }
 
 fn gemini_part_to_anthropic(part: &Value, state: &mut AnthropicStreamState) -> Vec<String> {
@@ -77,10 +103,12 @@ fn gemini_part_to_anthropic(part: &Value, state: &mut AnthropicStreamState) -> V
         events.push(format!("event: content_block_delta\ndata: {delta}\n\n"));
     }
 
+    note_part_signature(&mut state.thought_signature, &state.tool_ids, part);
     if let Some(fc) = part.get("functionCall") {
         let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
         let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
         let tool_id = format!("toolu_{}", uuid::Uuid::new_v4());
+        note_tool_call(&state.thought_signature, &mut state.tool_ids, &tool_id);
         let block_start = serde_json::json!({
             "type": "content_block_start",
             "index": state.block_index,
@@ -197,6 +225,8 @@ pub struct OpenAiStreamState {
     pub started: bool,
     pub finished: bool,
     pub created: u64,
+    pub thought_signature: String,
+    pub tool_ids: Vec<String>,
 }
 
 impl OpenAiStreamState {
@@ -211,6 +241,8 @@ impl OpenAiStreamState {
             started: false,
             finished: false,
             created,
+            thought_signature: String::new(),
+            tool_ids: Vec::new(),
         }
     }
 }
@@ -251,6 +283,7 @@ pub fn gemini_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec
 
     if let Some(parts_arr) = parts {
         for part in parts_arr {
+            note_part_signature(&mut state.thought_signature, &state.tool_ids, part);
             if let Some(text) = part.get("text").and_then(Value::as_str) {
                 let text_chunk = serde_json::json!({
                     "id": &state.completion_id,
@@ -272,6 +305,7 @@ pub fn gemini_to_openai_sse(chunk: &Value, state: &mut OpenAiStreamState) -> Vec
                 let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
                 let call_id = format!("call_{}", uuid::Uuid::new_v4());
+                note_tool_call(&state.thought_signature, &mut state.tool_ids, &call_id);
                 let tc_chunk = serde_json::json!({
                     "id": &state.completion_id,
                     "object": "chat.completion.chunk",
@@ -389,6 +423,7 @@ pub struct GeminiFunctionCall {
 pub struct CollectedGemini {
     pub text: String,
     pub function_calls: Vec<GeminiFunctionCall>,
+    pub thought_signature: Option<String>,
     pub finish_reason: Option<String>,
     pub prompt_tokens: u32,
     pub output_tokens: u32,
@@ -398,6 +433,7 @@ pub struct CollectedGemini {
 pub fn collect_gemini_response(chunks: &[Value]) -> CollectedGemini {
     let mut full_text = String::new();
     let mut function_calls = Vec::new();
+    let mut thought_signature: Option<String> = None;
     let mut finish_reason = None;
     let mut prompt_tokens = 0;
     let mut output_tokens = 0;
@@ -432,6 +468,11 @@ pub fn collect_gemini_response(chunks: &[Value]) -> CollectedGemini {
                     if let Some(t) = part.get("text").and_then(Value::as_str) {
                         full_text.push_str(t);
                     }
+                    if let Some(sig) = part_signature(part)
+                        && !sig.is_empty()
+                    {
+                        thought_signature = Some(sig.to_string());
+                    }
                     if let Some(fc) = part.get("functionCall")
                         && let Some(name) = fc.get("name").and_then(Value::as_str)
                     {
@@ -449,6 +490,7 @@ pub fn collect_gemini_response(chunks: &[Value]) -> CollectedGemini {
     CollectedGemini {
         text: full_text,
         function_calls,
+        thought_signature,
         finish_reason,
         prompt_tokens,
         output_tokens,
@@ -750,6 +792,53 @@ mod tests {
         assert_eq!(res.finish_reason.as_deref(), Some("STOP"));
         assert_eq!(res.prompt_tokens, 5);
         assert_eq!(res.output_tokens, 2);
+    }
+
+    #[test]
+    fn test_gemini_stream_records_signature_for_emitted_tool_id() {
+        let mut state = OpenAiStreamState::new("test-cmpl-sig", "gemini-3.8-flash-high");
+        let chunk = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": { "parts": [{
+                        "functionCall": { "name": "read", "args": {}, "id": "upstream-1" },
+                        "thoughtSignature": "pxsig_stream_1"
+                    }] }
+                }]
+            }
+        });
+        let events = gemini_to_openai_sse(&chunk, &mut state);
+        let mut tool_id = String::new();
+        for ev in &events {
+            if let Some(json_part) = ev.strip_prefix("data: ") {
+                let val: serde_json::Value = serde_json::from_str(json_part.trim()).unwrap();
+                if let Some(id) = val
+                    .pointer("/choices/0/delta/tool_calls/0/id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    tool_id = id.to_string();
+                }
+            }
+        }
+        assert_ne!(tool_id, "");
+        let entry = crate::utils::history_cache::lookup_tool_signature(&tool_id).unwrap();
+        assert_eq!(entry.thought_signature, "pxsig_stream_1");
+    }
+
+    #[test]
+    fn test_collect_gemini_response_captures_signature() {
+        let chunk = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": { "parts": [{
+                        "functionCall": { "name": "read", "args": {} },
+                        "thoughtSignature": "pxsig_buffered_1"
+                    }] }
+                }]
+            }
+        });
+        let res = collect_gemini_response(&[chunk]);
+        assert_eq!(res.thought_signature.as_deref(), Some("pxsig_buffered_1"));
     }
 
     #[test]
