@@ -188,6 +188,134 @@ pub fn write_completion_cache(key: &str, mut entry: CompletionEntry) {
     maybe_persist();
 }
 
+/// Map an Anthropic stop reason to a Gemini finish reason for unified storage, mirroring TS
+/// `mapAnthropicStopToGeminiFinish`. Returns `None` for `tool_use`/unknown so tool-call presence
+/// drives the replay mapping instead.
+#[must_use]
+pub fn map_anthropic_stop_to_gemini_finish(reason: Option<&str>) -> Option<&'static str> {
+    match reason {
+        Some("max_tokens" | "model_context_window_exceeded") => Some("MAX_TOKENS"),
+        Some("refusal") => Some("SAFETY"),
+        Some("end_turn" | "stop_sequence" | "pause_turn") => Some("STOP"),
+        _ => None,
+    }
+}
+
+/// Build a completion entry from a collected Gemini turn, mirroring TS `populateCompletionCache`.
+/// Returns `None` for empty turns (no text, reasoning, or tool calls), which TS does not store.
+#[must_use]
+pub fn gemini_completion_entry(
+    collected: &crate::utils::sse::CollectedGemini,
+    model: &str,
+    created: u64,
+) -> Option<CompletionEntry> {
+    if collected.text.is_empty() && collected.reasoning.is_empty() && collected.function_calls.is_empty() {
+        return None;
+    }
+    let token = crate::utils::history_cache::mint_reasoning_token(
+        collected.thought_signature.as_deref().unwrap_or(""),
+        &collected.reasoning,
+    );
+    Some(CompletionEntry {
+        text: collected.text.clone(),
+        reasoning: if collected.reasoning.is_empty() {
+            None
+        } else {
+            Some(collected.reasoning.clone())
+        },
+        thought_signature: if token.is_empty() { None } else { Some(token) },
+        finish_reason: collected.finish_reason.clone(),
+        tool_calls: if collected.function_calls.is_empty() {
+            None
+        } else {
+            Some(
+                collected
+                    .function_calls
+                    .iter()
+                    .map(|fc| CompletionToolCall {
+                        id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+                        name: fc.name.clone(),
+                        arguments: serde_json::to_string(&fc.args).unwrap_or_default(),
+                    })
+                    .collect(),
+            )
+        },
+        usage: CompletionUsage {
+            input_tokens: u64::from(collected.prompt_tokens),
+            output_tokens: u64::from(collected.output_tokens),
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        },
+        model: model.to_string(),
+        created,
+    })
+}
+
+/// Build a completion entry from a direct-Anthropic JSON response, mirroring TS `populateClaudeCache`.
+/// Returns `None` for empty turns.
+#[must_use]
+pub fn claude_completion_entry(response: &Value, model: &str, created: u64) -> Option<CompletionEntry> {
+    let blocks = response.get("content").and_then(Value::as_array);
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut signature = String::new();
+    let mut tool_calls = Vec::new();
+    if let Some(blocks) = blocks {
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str).unwrap_or("") {
+                "text" => {
+                    if let Some(t) = block.get("text").and_then(Value::as_str) {
+                        text.push_str(t);
+                    }
+                }
+                "thinking" => {
+                    if let Some(t) = block.get("thinking").and_then(Value::as_str) {
+                        reasoning.push_str(t);
+                    }
+                    if let Some(s) = block.get("signature").and_then(Value::as_str) {
+                        signature = s.to_string();
+                    }
+                }
+                "tool_use" => {
+                    tool_calls.push(CompletionToolCall {
+                        id: block.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                        name: block.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                        arguments: block
+                            .get("input")
+                            .map(|v| serde_json::to_string(v).unwrap_or_default())
+                            .unwrap_or_default(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    if text.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
+        return None;
+    }
+    let token = crate::utils::history_cache::mint_reasoning_token(&signature, &reasoning);
+    let usage = response.get("usage");
+    let num = |name: &str| usage.and_then(|u| u.get(name)).and_then(Value::as_u64).unwrap_or(0);
+    Some(CompletionEntry {
+        text,
+        reasoning: if reasoning.is_empty() { None } else { Some(reasoning) },
+        thought_signature: if token.is_empty() { None } else { Some(token) },
+        finish_reason: map_anthropic_stop_to_gemini_finish(response.get("stop_reason").and_then(Value::as_str))
+            .map(str::to_string),
+        tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+        usage: CompletionUsage {
+            input_tokens: num("input_tokens"),
+            output_tokens: num("output_tokens"),
+            cache_read_tokens: num("cache_read_input_tokens"),
+            cache_write_tokens: num("cache_creation_input_tokens"),
+            reasoning_tokens: 0,
+        },
+        model: model.to_string(),
+        created,
+    })
+}
+
 /// Fetch a fresh full response for a request key.
 #[must_use]
 pub fn lookup_completion(key: &str) -> Option<CompletionEntry> {
@@ -1138,6 +1266,95 @@ mod tests {
             b.iter()
                 .all(|x| x.get("type").and_then(Value::as_str) != Some("thinking"))
         }));
+    }
+
+    #[test]
+    fn test_anthropic_stop_mapper_matches_ts() {
+        use super::map_anthropic_stop_to_gemini_finish;
+        assert_eq!(
+            map_anthropic_stop_to_gemini_finish(Some("max_tokens")),
+            Some("MAX_TOKENS")
+        );
+        assert_eq!(
+            map_anthropic_stop_to_gemini_finish(Some("model_context_window_exceeded")),
+            Some("MAX_TOKENS")
+        );
+        assert_eq!(map_anthropic_stop_to_gemini_finish(Some("refusal")), Some("SAFETY"));
+        assert_eq!(map_anthropic_stop_to_gemini_finish(Some("end_turn")), Some("STOP"));
+        assert_eq!(map_anthropic_stop_to_gemini_finish(Some("stop_sequence")), Some("STOP"));
+        assert_eq!(map_anthropic_stop_to_gemini_finish(Some("pause_turn")), Some("STOP"));
+        assert_eq!(map_anthropic_stop_to_gemini_finish(Some("tool_use")), None);
+        assert_eq!(map_anthropic_stop_to_gemini_finish(None), None);
+    }
+
+    #[test]
+    fn test_gemini_entry_builder_gate_and_shape() {
+        use super::gemini_completion_entry;
+        use crate::utils::sse::{CollectedGemini, GeminiFunctionCall};
+        let empty = CollectedGemini {
+            text: String::new(),
+            reasoning: String::new(),
+            function_calls: Vec::new(),
+            thought_signature: None,
+            finish_reason: None,
+            prompt_tokens: 0,
+            output_tokens: 0,
+        };
+        assert!(gemini_completion_entry(&empty, "m", 99).is_none());
+        let full = CollectedGemini {
+            text: "hi".to_string(),
+            reasoning: "why".to_string(),
+            function_calls: vec![GeminiFunctionCall {
+                name: "noop".to_string(),
+                args: serde_json::json!({ "a": 1 }),
+            }],
+            thought_signature: Some("real_sig_pop".to_string()),
+            finish_reason: Some("STOP".to_string()),
+            prompt_tokens: 11,
+            output_tokens: 7,
+        };
+        let entry = gemini_completion_entry(&full, "m", 99).unwrap();
+        assert_eq!(entry.text, "hi");
+        assert_eq!(entry.finish_reason.as_deref(), Some("STOP"));
+        assert_eq!(entry.usage.input_tokens, 11);
+        assert_eq!(entry.created, 99);
+        let token = entry
+            .thought_signature
+            .expect("minted token must be stored, not the raw signature");
+        assert!(token.starts_with("pxsig_"));
+        assert!(!token.contains("real_sig_pop"));
+        let tc = entry.tool_calls.unwrap();
+        assert_eq!(tc.len(), 1);
+        assert_eq!(tc[0].name, "noop");
+        assert_eq!(tc[0].arguments, "{\"a\":1}");
+    }
+
+    #[test]
+    fn test_claude_entry_builder_parses_blocks() {
+        use super::claude_completion_entry;
+        let response = serde_json::json!({
+            "content": [
+                { "type": "thinking", "thinking": "plan", "signature": "claude_sig_1" },
+                { "type": "text", "text": "done" },
+                { "type": "tool_use", "id": "toolu_1", "name": "read", "input": { "p": "x" } }
+            ],
+            "stop_reason": "max_tokens",
+            "usage": { "input_tokens": 20, "output_tokens": 9, "cache_read_input_tokens": 5 }
+        });
+        let entry = claude_completion_entry(&response, "c", 100).unwrap();
+        assert_eq!(entry.text, "done");
+        assert_eq!(entry.reasoning.as_deref(), Some("plan"));
+        assert_eq!(entry.finish_reason.as_deref(), Some("MAX_TOKENS"));
+        assert_eq!(entry.usage.input_tokens, 20);
+        assert_eq!(entry.usage.cache_read_tokens, 5);
+        let token = entry.thought_signature.unwrap();
+        assert!(token.starts_with("pxsig_"));
+        let tc = entry.tool_calls.unwrap();
+        assert_eq!(tc[0].id, "toolu_1");
+        assert_eq!(tc[0].arguments, "{\"p\":\"x\"}");
+
+        let empty = serde_json::json!({ "content": [], "stop_reason": "end_turn" });
+        assert!(claude_completion_entry(&empty, "c", 100).is_none());
     }
 
     #[test]

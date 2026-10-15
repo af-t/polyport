@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::app::AppState;
-use crate::config::RouteDecision;
+use crate::config::{ModelNotFoundError, RouteDecision};
 use crate::mappers::codex::{map_anthropic_to_responses, map_openai_to_responses};
 use crate::mappers::gemini::{map_anthropic_tools_for_gemini, map_messages_to_gemini, map_openai_tools_for_gemini};
-use crate::model_mapping::{MappingEndpoint, get_route_fingerprint, resolve_route_candidates};
+use crate::model_mapping::{MappingEndpoint, RouteCandidate, get_route_fingerprint, resolve_route_candidates};
 use crate::services::account_pool::AttemptError;
 use crate::services::anthropic::{
     CallClaudeParams, ClaudeStreamResult, apply_thinking_constraints, call_claude_stream, map_anthropic_model,
@@ -165,12 +165,23 @@ fn handle_gemini_messages_stream(stream_res: GeminiStreamResult, model: &str, hi
     })
 }
 
-async fn handle_gemini_messages_buffered(stream_res: GeminiStreamResult, model: &str, history_key: &str) -> Response {
+async fn handle_gemini_messages_buffered(
+    stream_res: GeminiStreamResult,
+    model: &str,
+    history_key: &str,
+    cache_key: &str,
+) -> Response {
     let full_body = stream_res.response.text().await.unwrap_or_default();
     let chunks: Vec<Value> = full_body.lines().filter_map(parse_gemini_sse_line).collect();
     let res = collect_gemini_response(&chunks);
     if let Some(sig) = res.thought_signature.as_deref() {
         record_history(history_key, sig, &res.reasoning);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if let Some(entry) = crate::utils::completion_cache::gemini_completion_entry(&res, model, now) {
+        crate::utils::completion_cache::write_completion_cache(cache_key, entry);
     }
 
     let mut content = Vec::new();
@@ -219,6 +230,7 @@ async fn dispatch_gemini_messages(
     route: &RouteDecision,
     preferred_account_id: Option<String>,
     lookup_keys: &[String],
+    cache_key: &str,
 ) -> Response {
     let is_thinking_requested = req.thinking.is_some()
         || requested_effort(
@@ -286,7 +298,7 @@ async fn dispatch_gemini_messages(
             if req.stream.unwrap_or(false) {
                 handle_gemini_messages_stream(stream_res, model_name, &history_key)
             } else {
-                handle_gemini_messages_buffered(stream_res, model_name, &history_key).await
+                handle_gemini_messages_buffered(stream_res, model_name, &history_key, cache_key).await
             }
         }
         Err(err) => attempt_error_to_response(&err),
@@ -296,21 +308,21 @@ async fn dispatch_gemini_messages(
 async fn dispatch_claude_messages(
     state: &AppState,
     req: &MessagesRequest,
-    upstream_model: &str,
-    model_class: ModelClass,
+    route: &RouteDecision,
     preferred_account_id: Option<String>,
     lookup_keys: &[String],
     headers: HeaderMap,
+    cache_key: &str,
 ) -> Response {
     let mut claude_body = serde_json::to_value(req).unwrap_or_default();
-    let mapped_model = map_anthropic_model(upstream_model);
+    let mapped_model = map_anthropic_model(&route.upstream_model);
     claude_body["model"] = Value::String(mapped_model);
     claude_body["system"] = Value::Array(with_claude_code_identity(req.system.as_ref()));
     apply_thinking_constraints(&mut claude_body);
 
     let params = CallClaudeParams {
         body: claude_body,
-        model_class,
+        model_class: route.model_class,
         preferred_account_id,
         client_headers: Some(headers),
     };
@@ -330,6 +342,17 @@ async fn dispatch_claude_messages(
                     .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
             } else {
                 let bytes = stream_res.response.bytes().await.unwrap_or_default();
+                if let Ok(json_val) = serde_json::from_slice::<Value>(&bytes) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    let model_name = req.model.clone().unwrap_or_else(|| route.upstream_model.clone());
+                    if let Some(entry) =
+                        crate::utils::completion_cache::claude_completion_entry(&json_val, &model_name, now)
+                    {
+                        crate::utils::completion_cache::write_completion_cache(cache_key, entry);
+                    }
+                }
                 Response::builder()
                     .header("Content-Type", "application/json")
                     .status(StatusCode::OK)
@@ -452,6 +475,23 @@ fn cache_bypassed(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.as_bytes() == b"no-cache")
 }
 
+struct ResolvedRoute {
+    candidates: Result<Vec<RouteCandidate>, ModelNotFoundError>,
+    cache_key: String,
+}
+
+fn resolve_with_cache_key(raw: &Value, model: &str, endpoint: MappingEndpoint, effort: Option<&str>) -> ResolvedRoute {
+    let candidates = resolve_route_candidates(model, endpoint, effort);
+    let fingerprint = candidates
+        .as_ref()
+        .ok()
+        .and_then(|c| get_route_fingerprint(c, endpoint));
+    ResolvedRoute {
+        candidates,
+        cache_key: completion_key(raw, fingerprint.as_deref()),
+    }
+}
+
 fn sse_hit_response(events: &[String]) -> Response {
     Response::builder()
         .header("Content-Type", "text/event-stream")
@@ -526,19 +566,15 @@ pub async fn v1_messages_handler(State(state): State<AppState>, headers: HeaderM
         req.reasoning.as_ref(),
         req.output_config.as_ref(),
     );
-    let resolve_result = resolve_route_candidates(&model, MappingEndpoint::Messages, effort.as_deref());
-    let fingerprint = resolve_result
-        .as_ref()
-        .ok()
-        .and_then(|c| get_route_fingerprint(c, MappingEndpoint::Messages));
-    let cache_key = completion_key(&raw, fingerprint.as_deref());
+    let resolved = resolve_with_cache_key(&raw, &model, MappingEndpoint::Messages, effort.as_deref());
     if !cache_bypassed(&headers)
-        && let Some(entry) = lookup_completion(&cache_key)
+        && let Some(entry) = lookup_completion(&resolved.cache_key)
     {
-        tracing::info!("[Cache] HIT for Anthropic Messages: {cache_key}");
+        tracing::info!("[Cache] HIT for Anthropic Messages: {}", resolved.cache_key);
         return messages_hit_response(&req, &entry);
     }
-    let candidates = match resolve_result {
+    let cache_key = resolved.cache_key;
+    let candidates = match resolved.candidates {
         Ok(c) => c,
         Err(err) => {
             return (
@@ -570,17 +606,25 @@ pub async fn v1_messages_handler(State(state): State<AppState>, headers: HeaderM
 
     match candidate.route.provider {
         Provider::Gemini => {
-            dispatch_gemini_messages(&state, &req, &candidate.route, preferred_account_id, &lookup_keys).await
+            dispatch_gemini_messages(
+                &state,
+                &req,
+                &candidate.route,
+                preferred_account_id,
+                &lookup_keys,
+                &cache_key,
+            )
+            .await
         }
         Provider::Claude => {
             dispatch_claude_messages(
                 &state,
                 &req,
-                &candidate.route.upstream_model,
-                candidate.route.model_class,
+                &candidate.route,
                 preferred_account_id,
                 &lookup_keys,
                 headers,
+                &cache_key,
             )
             .await
         }
@@ -621,6 +665,7 @@ async fn handle_gemini_completions_buffered(
     model: &str,
     history_key: &str,
     reasoning_excluded: bool,
+    cache_key: &str,
 ) -> Response {
     let full_body = stream_res.response.text().await.unwrap_or_default();
     let chunks: Vec<Value> = full_body.lines().filter_map(parse_gemini_sse_line).collect();
@@ -630,6 +675,9 @@ async fn handle_gemini_completions_buffered(
         .map_or(0, |d| d.as_secs());
     if let Some(sig) = res.thought_signature.as_deref() {
         record_history(history_key, sig, &res.reasoning);
+    }
+    if let Some(entry) = crate::utils::completion_cache::gemini_completion_entry(&res, model, now) {
+        crate::utils::completion_cache::write_completion_cache(cache_key, entry);
     }
 
     let mut message = serde_json::json!({ "role": "assistant", "content": res.text });
@@ -703,6 +751,7 @@ async fn dispatch_gemini_completions(
     route: &RouteDecision,
     preferred_account_id: Option<String>,
     lookup_keys: &[String],
+    cache_key: &str,
 ) -> Response {
     let is_thinking_requested = requested_effort(
         req.effort.as_deref(),
@@ -766,7 +815,7 @@ async fn dispatch_gemini_completions(
             if req.stream.unwrap_or(false) {
                 handle_gemini_completions_stream(stream_res, model_name, &history_key, excluded)
             } else {
-                handle_gemini_completions_buffered(stream_res, model_name, &history_key, excluded).await
+                handle_gemini_completions_buffered(stream_res, model_name, &history_key, excluded, cache_key).await
             }
         }
         Err(err) => attempt_error_to_response(&err),
@@ -841,8 +890,14 @@ fn handle_claude_completions_stream(stream_res: ClaudeStreamResult, model: &str)
     })
 }
 
-async fn handle_claude_completions_buffered(stream_res: ClaudeStreamResult, model: &str) -> Response {
+async fn handle_claude_completions_buffered(stream_res: ClaudeStreamResult, model: &str, cache_key: &str) -> Response {
     let json_val: Value = stream_res.response.json().await.unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if let Some(entry) = crate::utils::completion_cache::claude_completion_entry(&json_val, model, now) {
+        crate::utils::completion_cache::write_completion_cache(cache_key, entry);
+    }
     let text = json_val
         .get("content")
         .and_then(Value::as_array)
@@ -888,16 +943,16 @@ async fn handle_claude_completions_buffered(stream_res: ClaudeStreamResult, mode
 async fn dispatch_claude_completions(
     state: &AppState,
     req: &CompletionsRequest,
-    upstream_model: &str,
-    model_class: ModelClass,
+    route: &RouteDecision,
     preferred_account_id: Option<String>,
     lookup_keys: &[String],
     headers: HeaderMap,
+    cache_key: &str,
 ) -> Response {
-    let claude_body = map_openai_request_to_claude(req, upstream_model);
+    let claude_body = map_openai_request_to_claude(req, &route.upstream_model);
     let params = CallClaudeParams {
         body: claude_body,
-        model_class,
+        model_class: route.model_class,
         preferred_account_id,
         client_headers: Some(headers),
     };
@@ -908,11 +963,11 @@ async fn dispatch_claude_completions(
                 let mut guard = state.pool.write().await;
                 guard.record_account_pin(Provider::Claude, lookup_keys, Some(&stream_res.account_id));
             }
-            let model_name = req.model.clone().unwrap_or_else(|| upstream_model.to_string());
+            let model_name = req.model.clone().unwrap_or_else(|| route.upstream_model.clone());
             if req.stream.unwrap_or(false) {
                 handle_claude_completions_stream(stream_res, &model_name)
             } else {
-                handle_claude_completions_buffered(stream_res, &model_name).await
+                handle_claude_completions_buffered(stream_res, &model_name, cache_key).await
             }
         }
         Err(err) => attempt_error_to_response(&err),
@@ -1048,19 +1103,15 @@ pub async fn v1_chat_completions_handler(State(state): State<AppState>, headers:
         req.reasoning.as_ref(),
         req.output_config.as_ref(),
     );
-    let resolve_result = resolve_route_candidates(&model, MappingEndpoint::OpenAi, effort.as_deref());
-    let fingerprint = resolve_result
-        .as_ref()
-        .ok()
-        .and_then(|c| get_route_fingerprint(c, MappingEndpoint::OpenAi));
-    let cache_key = completion_key(&raw, fingerprint.as_deref());
+    let resolved = resolve_with_cache_key(&raw, &model, MappingEndpoint::OpenAi, effort.as_deref());
     if !cache_bypassed(&headers)
-        && let Some(entry) = lookup_completion(&cache_key)
+        && let Some(entry) = lookup_completion(&resolved.cache_key)
     {
-        tracing::info!("[Cache] HIT for OpenAI Chat completions: {cache_key}");
+        tracing::info!("[Cache] HIT for OpenAI Chat completions: {}", resolved.cache_key);
         return completions_hit_response(&raw, &req, &entry);
     }
-    let candidates = match resolve_result {
+    let cache_key = resolved.cache_key;
+    let candidates = match resolved.candidates {
         Ok(c) => c,
         Err(err) => {
             return (
@@ -1092,17 +1143,25 @@ pub async fn v1_chat_completions_handler(State(state): State<AppState>, headers:
 
     match candidate.route.provider {
         Provider::Gemini => {
-            dispatch_gemini_completions(&state, &req, &candidate.route, preferred_account_id, &lookup_keys).await
+            dispatch_gemini_completions(
+                &state,
+                &req,
+                &candidate.route,
+                preferred_account_id,
+                &lookup_keys,
+                &cache_key,
+            )
+            .await
         }
         Provider::Claude => {
             dispatch_claude_completions(
                 &state,
                 &req,
-                &candidate.route.upstream_model,
-                candidate.route.model_class,
+                &candidate.route,
                 preferred_account_id,
                 &lookup_keys,
                 headers,
+                &cache_key,
             )
             .await
         }
