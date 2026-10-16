@@ -1299,11 +1299,9 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
- "mime_guess",
  "polyport-agent",
  "polyport-core",
- "rust-embed",
- "serde_json",
+ "polyport-webui",
  "tempfile",
  "tokio",
  "tower",
@@ -1352,6 +1350,20 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "polyport-webui"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "mime_guess",
+ "polyport-core",
+ "rust-embed",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

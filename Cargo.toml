@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["agent", "core", "webui"]
-default-members = ["webui"]
+members = ["agent", "cli", "core", "webui"]
+default-members = ["cli"]
 
 [workspace.lints.rust]
 warnings = "deny"

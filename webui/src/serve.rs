@@ -1,32 +1,27 @@
 use axum::Router;
 use axum::handler::Handler;
 use axum::routing::get;
-use polyport_core::app::{AppState, create_app};
 
 use crate::file_api::{FileState, file_handler};
 use crate::static_files::{UiState, static_fallback};
 
-pub fn build_webui_app(core_state: AppState, ui_state: UiState, file_state: FileState, proxy_only: bool) -> Router {
-    let mut app = create_app(core_state).route("/api/file", get(file_handler).with_state(file_state.clone()));
-    if !proxy_only {
-        let port = polyport_core::config::get_port();
-        app = app.merge(polyport_agent::ws::agent_router_with_root(
-            port,
-            file_state.sandbox_root,
-        ));
-        app = app.fallback_service(static_fallback.with_state(ui_state));
+pub fn mount_webui_routes(app: Router, ui_state: UiState, file_state: FileState, proxy_only: bool) -> Router {
+    let app = app.route("/api/file", get(file_handler).with_state(file_state));
+    if proxy_only {
+        app
+    } else {
+        app.fallback_service(static_fallback.with_state(ui_state))
     }
-    app
 }
 
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use polyport_core::app::AppState;
+    use polyport_core::app::{AppState, create_app};
     use tower::ServiceExt;
 
-    use super::build_webui_app;
+    use super::mount_webui_routes;
     use crate::file_api::FileState;
     use crate::static_files::UiState;
 
@@ -43,7 +38,8 @@ mod tests {
         let file_state = FileState {
             sandbox_root: temp_dir.path().to_path_buf(),
         };
-        let app = build_webui_app(core_state, ui_state, file_state, true);
+        let base_app = create_app(core_state);
+        let app = mount_webui_routes(base_app, ui_state, file_state, true);
         let req = Request::builder().uri("/").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
@@ -63,7 +59,8 @@ mod tests {
         let file_state = FileState {
             sandbox_root: temp_dir.path().to_path_buf(),
         };
-        let app = build_webui_app(core_state, ui_state, file_state, false);
+        let base_app = create_app(core_state);
+        let app = mount_webui_routes(base_app, ui_state, file_state, false);
         let req = Request::builder().uri("/").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -81,7 +78,8 @@ mod tests {
         let file_state = FileState {
             sandbox_root: temp_dir.path().to_path_buf(),
         };
-        let app = build_webui_app(core_state, ui_state, file_state, false);
+        let base_app = create_app(core_state);
+        let app = mount_webui_routes(base_app, ui_state, file_state, false);
         let req = Request::builder().uri("/api/file?path=").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -97,41 +95,10 @@ mod tests {
         let file_state = FileState {
             sandbox_root: temp_dir.path().to_path_buf(),
         };
-        let app = build_webui_app(core_state, ui_state, file_state, false);
+        let base_app = create_app(core_state);
+        let app = mount_webui_routes(base_app, ui_state, file_state, false);
         let req = Request::builder().uri("/health").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_chat_ws_excluded_when_proxy_only() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let core_state = AppState::default();
-        let ui_state = UiState {
-            asset_dir: Some(temp_dir.path().to_path_buf()),
-        };
-        let file_state = FileState {
-            sandbox_root: temp_dir.path().to_path_buf(),
-        };
-        let app = build_webui_app(core_state, ui_state, file_state, true);
-        let req = Request::builder().uri("/api/chat").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_chat_ws_mounted_when_not_proxy_only() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let core_state = AppState::default();
-        let ui_state = UiState {
-            asset_dir: Some(temp_dir.path().to_path_buf()),
-        };
-        let file_state = FileState {
-            sandbox_root: temp_dir.path().to_path_buf(),
-        };
-        let app = build_webui_app(core_state, ui_state, file_state, false);
-        let req = Request::builder().uri("/api/chat").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_ne!(res.status(), StatusCode::NOT_FOUND);
     }
 }

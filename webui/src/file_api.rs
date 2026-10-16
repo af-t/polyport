@@ -55,7 +55,7 @@ fn error_response(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
-#[allow(clippy::unused_async)]
+#[allow(clippy::unused_async, clippy::implicit_hasher)]
 pub async fn file_handler(State(state): State<FileState>, Query(q): Query<HashMap<String, String>>) -> Response {
     let Some(path) = q.get("path") else {
         return error_response(StatusCode::BAD_REQUEST, "Missing path parameter");
